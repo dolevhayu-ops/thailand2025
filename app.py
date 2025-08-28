@@ -232,3 +232,16 @@ def twilio_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+@app.route("/test/openai", methods=["GET"])
+def test_openai():
+    try:
+        r = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            timeout=30,
+        )
+        return f"OK: {r.choices[0].message.content}", 200
+    except Exception as e:
+        logger.exception("OpenAI test endpoint failed: %s", e)
+        return f"OpenAI error: {e}", 500
