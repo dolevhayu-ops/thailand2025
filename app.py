@@ -10,6 +10,7 @@ app = Flask(__name__)
 ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 CONV_SID    = os.environ.get("TWILIO_CONVERSATION_SID", "").strip()
+SERVICE_SID = os.environ.get("TWILIO_SERVICE_SID", "").strip()  # NEW: IS...
 
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
@@ -30,19 +31,19 @@ def rnd(seq):
 def flair(text: str) -> str:
     return f"{rnd(PFX)}{text} {rnd(EMOJIS)}"
 
-# ==== Twilio send helper ====
+# ==== Twilio send helper (SERVICE-SCOPED) ====
 def send_msg(body: str):
-    if not (ACCOUNT_SID and AUTH_TOKEN and CONV_SID):
-        print("Missing env vars for Twilio; cannot send:", body)
+    if not (ACCOUNT_SID and AUTH_TOKEN and CONV_SID and SERVICE_SID):
+        print("Missing env vars (need ACCOUNT_SID, AUTH_TOKEN, CONV_SID, SERVICE_SID); cannot send:", body)
         return
     try:
-        # v1 API (avoids deprecation warning)
-        client.conversations.v1.conversations(CONV_SID).messages.create(
-            author="bot",
-            body=body
-        )
+        # שימוש בערוץ שעבד לך: Service + Conversation
+        client.conversations.v1.services(SERVICE_SID)\
+            .conversations(CONV_SID)\
+            .messages\
+            .create(author="bot", body=body)
     except Exception as e:
-        print("Failed to send message via Twilio:", e)
+        print("Failed to send message via Twilio (service-scoped):", e)
 
 # ==== Commands ====
 def handle_help():
