@@ -73,6 +73,19 @@ try:
 except Exception:
     ZoneInfo = None
 
+
+
+def normalize_waid(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return s
+    s = s.strip()
+    if s.startswith("whatsapp:"):
+        s = s[len("whatsapp:"):]
+    s = s.lstrip("+")
+    return s
+
+
+
 # ------------------------- קונפיג ולוגים -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -103,7 +116,8 @@ CONTACT_ALIASES: Dict[str, str] = {}
 for pair in (os.getenv("CONTACT_ALIASES","").split(",") if os.getenv("CONTACT_ALIASES") else []):
     if "=" in pair:
         name, wa = pair.split("=", 1)
-        CONTACT_ALIASES[name.strip()] = wa.strip()
+        CONTACT_ALIASES[name.strip()] = normalize_waid(wa.strip())
+
 
 DEFAULT_LOOKAHEAD_DAYS = int(os.getenv("DEFAULT_LOOKAHEAD_DAYS", "90"))
 
@@ -987,7 +1001,8 @@ def twilio_webhook():
     if not _validated_twilio_request():
         abort(403)
     from_ = request.form.get("From", "")
-    waid = request.form.get("WaId", from_) or from_
+    waid_raw = request.form.get("WaId", from_) or from_
+    waid = normalize_waid(waid_raw) or from_
     body = request.form.get("Body", "") or ""
     num_media = int(request.form.get("NumMedia", "0") or 0)
     latitude = request.form.get("Latitude")
