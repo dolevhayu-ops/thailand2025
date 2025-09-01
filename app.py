@@ -13,6 +13,7 @@ WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Go
 - Google Calendar OAuth: הוספת אירועים אוטומטית ליומן
 - Vision לתמונות: חילוץ פרטי טיסה/מלון מתמונה
 - המלצות לפי עיר + קטגוריה
+- === FLIGHT WATCH === מעקב טיסות חינמי: פקודות וואטסאפ (“עקוב אחרי טיסה …”, “בטל …”, “רשימה”), Cron לבדיקה ושליחת התראות
 
 ENV (Render → Environment):
 OPENAI_API_KEY
@@ -20,7 +21,7 @@ OPENAI_MODEL                (default: gpt-4o-mini)
 SYSTEM_PROMPT               (optional)
 VERIFY_TWILIO_SIGNATURE     ('false' default)
 TWILIO_AUTH_TOKEN           (נדרש לאימות חתימה ולהורדת מדיה)
-TWILIO_ACCOUNT_SID          (נדרש להורדת מדיה)
+TWILIO_ACCOUNT_SID          (נדרש להורדת/שליחת מדיה)
 TWILIO_WHATSAPP_FROM        ('whatsapp:+1415...' או מספר וואטסאפ פעיל) או TWILIO_MESSAGING_SERVICE_SID
 BASE_PUBLIC_URL             (e.g. https://thailand2025.onrender.com)
 CRON_SECRET                 (סיסמה ל-/cron/*)
@@ -31,11 +32,15 @@ GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 GOOGLE_OAUTH_REDIRECT_URI   (e.g. https://<domain>/google/oauth/callback)
 
+# === FLIGHT WATCH ===
+AVIATIONSTACK_KEY           (מפתח חינמי לסטטוס טיסות)
+NOTIFY_CC_WAIDS            (אופציונלי: whatsapp:+9725...,whatsapp:+9725...)
+
 Start command (Render):
 gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
 """
 
-import os, re, time, uuid, sqlite3, logging, json, mimetypes
+import os, re, time, uuid, sqlite3, logging, json, mimetypes, hmac, hashlib, base64
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -83,14 +88,16 @@ BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
 CRON_SECRET = os.getenv("CRON_SECRET", "changeme")
 TZ = os.getenv("TZ", "UTC")
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+# === FLIGHT WATCH – config ===
+AVIATIONSTACK_KEY = os.getenv("AVIATIONSTACK_KEY", "")
+AVIATIONSTACK_URL = "http://api.aviationstack.com/v1/flights"
+NOTIFY_CC_WAIDS = [x.strip() for x in os.getenv("NOTIFY_CC_WAIDS", "").split(",") if x.strip()]
 
+# OpenAI
 api_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=api_key) if api_key else None
 
+# Twilio
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -188,13 +195,21 @@ def init_db():
             waid TEXT,
             created_at TEXT
         );
+
+        -- === FLIGHT WATCH === מנויים למעקב טיסות
+        CREATE TABLE IF NOT EXISTS flight_watch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            waid TEXT NOT NULL,            -- whatsapp:+9725...
+            flight_iata TEXT NOT NULL,     -- לדוגמה LY7
+            flight_date TEXT,              -- YYYY-MM-DD (אופציונלי)
+            provider TEXT DEFAULT 'aviationstack',
+            last_snapshot TEXT,
+            last_hash TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
-    # שדרוג סכמות ישנות (אם חסר עמודה)
-    try:
-        db.execute("ALTER TABLE recs ADD COLUMN category TEXT")
-    except Exception:
-        pass
     db.commit()
 
 with app.app_context():
@@ -277,8 +292,8 @@ def parse_dates(text: str) -> List[str]:
                     y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
                 else:
                     d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                dt = datetime(y, mo, d)
-                out.append(dt.strftime("%Y-%m-%d"))
+                dt_ = datetime(y, mo, d)
+                out.append(dt_.strftime("%Y-%m-%d"))
             except Exception:
                 continue
     return list(dict.fromkeys(out))
@@ -378,7 +393,7 @@ def get_google_flow() -> Optional[Flow]:
             "redirect_uris": [GOOGLE_OAUTH_REDIRECT_URI]
         }
     }
-    flow = Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES)
+    flow = Flow.from_client_config(client_config, scopes=["https://www.googleapis.com/auth/calendar"])
     flow.redirect_uri = GOOGLE_OAUTH_REDIRECT_URI
     return flow
 
@@ -397,7 +412,7 @@ def load_google_creds(waid: str) -> Optional[Credentials]:
     row = get_db().execute("SELECT token_json FROM google_tokens WHERE waid=?", (waid,)).fetchone()
     if not row:
         return None
-    creds = Credentials.from_authorized_user_info(json.loads(row["token_json"]), scopes=GOOGLE_SCOPES)
+    creds = Credentials.from_authorized_user_info(json.loads(row["token_json"]), scopes=["https://www.googleapis.com/auth/calendar"])
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
@@ -420,7 +435,6 @@ def add_calendar_event(waid: str, summary: str, description: str, start_iso: str
             "end": {"date": end_iso or start_iso},
         }
     else:
-        # start_iso: "YYYY-MM-DDTHH:MM:00"
         event = {
             "summary": summary,
             "description": description,
@@ -473,7 +487,6 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
              flight.get("pnr"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
         )
         db.commit()
-        # הוספה לקלנדר אם יש OAuth
         start_iso = to_dt_iso(flight.get("depart_date"), flight.get("depart_time"))
         summary = f"✈️ {flight.get('origin') or ''}→{flight.get('dest') or ''} {flight.get('flight_number') or ''}".strip()
         desc = f"Airline: {flight.get('airline') or ''}\nPNR: {flight.get('pnr') or ''}"
@@ -499,7 +512,6 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
              hotel.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
         )
         db.commit()
-        # Calendar
         add_calendar_event(
             waid,
             f"🏨 Check-in: {hotel.get('hotel_name') or ''}",
@@ -536,7 +548,7 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
     db.commit()
     # Index content
     try:
-        excerpt = f"{title or ''}\n{tags or ''}"
+        excerpt = f"{title or ''}\n" + (tags or "")
         if (content_type or "").lower().startswith("text/"):
             text = data.decode("utf-8", errors="ignore")
             excerpt += "\n" + text[:4000]
@@ -551,7 +563,6 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
             excerpt += "\n" + text[:4000]
             index_booking_from_text(waid, text, fid, excerpt[:2000])
         elif (content_type or "").lower().startswith("image/"):
-            # Vision: נשתמש ב-URL הציבורי שלנו לתמונה ששמרנו
             img_url = public_base_url() + f"files/{fid}"
             ai = ai_extract_booking_from_image(img_url, hint=f"File name: {name}")
             if ai:
@@ -666,26 +677,123 @@ def build_flight_links(origin: Optional[str], dest: Optional[str], depart: Optio
         g, k = "https://www.google.com/travel/flights", "https://www.kayak.com/flights"
     return [g, k]
 
+# ------------------------- === FLIGHT WATCH === core -------------------------
+IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
+DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+
+def _fw_parse_track(text: str):
+    t = (text or "").strip()
+    if not any(k in t.lower() for k in ["עקוב", "track"]):
+        return None, None, False
+    m = IATA_RE.search(t.upper())
+    if not m:
+        return None, None, True
+    flight = m.group(1).upper()
+    dm = DATE_RE.search(t)
+    date_str = dm.group(1) if dm else None
+    return flight, date_str, True
+
+def _fw_parse_untrack(text: str):
+    if not any(k in (text or "").lower() for k in ["בטל", "unsubscribe", "untrack", "הסר"]):
+        return None
+    m = IATA_RE.search((text or "").upper())
+    return m.group(1).upper() if m else "__ALL__"  # מאפשר "בטל" בלי מזהה למחיקת הכל
+
+def _fw_is_list(text: str):
+    return any(k in (text or "").lower() for k in ["רשימה", "list flights", "list"])
+
+def _fw_send_to_all(primary_waid: str, body: str):
+    recips = [primary_waid] + [r for r in NOTIFY_CC_WAIDS if r and r != primary_waid]
+    for r in recips:
+        send_whatsapp(r, body)
+
+def _fw_fmt_time_both(iso_ts: str) -> str:
+    if not iso_ts:
+        return "-"
+    try:
+        t_utc = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except Exception:
+        return iso_ts
+    s_utc = t_utc.strftime("%Y-%m-%d %H:%M UTC")
+    if ZoneInfo:
+        try:
+            t_loc = t_utc.astimezone(ZoneInfo(TZ))
+            s_loc = t_loc.strftime(f"%Y-%m-%d %H:%M {TZ}")
+            return f"{s_utc} | {s_loc}"
+        except Exception:
+            pass
+    return s_utc
+
+def _fw_snapshot_from_aviationstack(rec: dict):
+    def safe(*keys, default=None):
+        cur = rec
+        for k in keys:
+            if not isinstance(cur, dict): return default
+            cur = cur.get(k)
+        return cur
+    status = safe("flight_status")
+    dep = {
+        "airport": safe("departure","airport"),
+        "scheduled": safe("departure","scheduled"),
+        "estimated": safe("departure","estimated"),
+        "actual": safe("departure","actual"),
+        "terminal": safe("departure","terminal"),
+        "gate": safe("departure","gate")
+    }
+    arr = {
+        "airport": safe("arrival","airport"),
+        "scheduled": safe("arrival","scheduled"),
+        "estimated": safe("arrival","estimated"),
+        "actual": safe("arrival","actual"),
+        "terminal": safe("arrival","terminal"),
+        "gate": safe("arrival","gate"),
+        "baggage": safe("arrival","baggage")
+    }
+    flight = {
+        "iata": safe("flight","iata"),
+        "icao": safe("flight","icao"),
+        "number": safe("flight","number")
+    }
+    airline = safe("airline","name")
+    return {"status": status, "airline": airline, "flight": flight, "departure": dep, "arrival": arr}
+
+def _fw_snapshot_hash(snap: dict) -> str:
+    return hashlib.sha256(json.dumps(snap, sort_keys=True).encode("utf-8")).hexdigest()
+
+def _fw_format_message(snap: dict) -> str:
+    f = snap.get("flight", {}) or {}
+    dep = snap.get("departure", {}) or {}
+    arr = snap.get("arrival", {}) or {}
+    lines = [
+        f"✈️ עדכון טיסה {f.get('iata') or f.get('number','')}",
+        f"סטטוס: {snap.get('status','-')} | חברת תעופה: {snap.get('airline','-')}",
+        f"יציאה: {dep.get('airport','-')} טרמ' {dep.get('terminal','-')} שער {dep.get('gate','-')}",
+        f"זמני יציאה: מתוכנן {_fw_fmt_time_both(dep.get('scheduled'))} | משוער {_fw_fmt_time_both(dep.get('estimated'))} | בפועל {_fw_fmt_time_both(dep.get('actual'))}",
+        f"הגעה: {arr.get('airport','-')} טרמ' {arr.get('terminal','-')} שער {arr.get('gate','-')} (מסוע {arr.get('baggage','-')})",
+        f"זמני הגעה: מתוכנן {_fw_fmt_time_both(arr.get('scheduled'))} | משוער {_fw_fmt_time_both(arr.get('estimated'))} | בפועל {_fw_fmt_time_both(arr.get('actual'))}",
+    ]
+    return "\n".join(lines)
+
+def _fw_fetch_aviationstack(flight_iata: str, flight_date: Optional[str]):
+    if not AVIATIONSTACK_KEY:
+        return {"error": "Missing AVIATIONSTACK_KEY"}
+    params = {"access_key": AVIATIONSTACK_KEY, "flight_iata": flight_iata}
+    if flight_date:
+        params["flight_date"] = flight_date
+    r = requests.get(AVIATIONSTACK_URL, params=params, timeout=25)
+    if r.status_code != 200:
+        return {"error": f"aviationstack HTTP {r.status_code}", "body": r.text}
+    try:
+        data = r.json()
+    except Exception as e:
+        return {"error": f"aviationstack JSON parse: {e}", "body": r.text}
+    return {"data": data.get("data", [])}
+
 # ------------------------- Routes בסיס -------------------------
 @app.route("/", methods=["GET", "HEAD"])
 @app.route("/health", methods=["GET"])
 def health():
     return "Your service is live 🎉", 200
-
-@app.route("/test/openai", methods=["GET"])
-def test_openai():
-    if not openai_client:
-        return "OpenAI client not configured", 200
-    try:
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"user","content":"ping"}],
-            temperature=0.0, timeout=25,
-        )
-        return f"OK: {(r.choices[0].message.content or '').strip()}", 200
-    except Exception as e:
-        logger.exception("OpenAI test endpoint failed: %s", e)
-        return f"OpenAI error: {e}", 500
 
 @app.route("/status", methods=["GET"])
 def status():
@@ -695,7 +803,8 @@ def status():
     h = db.execute("SELECT COUNT(*) c FROM hotels").fetchone()["c"]
     r = db.execute("SELECT COUNT(*) c FROM recs").fetchone()["c"]
     gcount = db.execute("SELECT COUNT(*) c FROM google_tokens").fetchone()["c"]
-    return jsonify(ok=True, files=f, flights=fl, hotels=h, recs=r, google_tokens=gcount, now=str(tz_now()))
+    fw = db.execute("SELECT COUNT(*) c FROM flight_watch").fetchone()["c"]
+    return jsonify(ok=True, files=f, flights=fl, hotels=h, recs=r, google_tokens=gcount, flight_watch=fw, now=str(tz_now()))
 
 # ------------------------- Upload/Files/ICS -------------------------
 @app.route("/upload", methods=["POST"])
@@ -804,8 +913,9 @@ def handle_commands(body: str, waid: str) -> Optional[str]:
             "• חיפוש טיסות: 'תמצא לי טיסה לפוקט ב-2025-09-12'\n"
             "• שליחת קובץ: שלחו PDF/תמונה – אני אשמור. 'שלח לי את הכרטיס'\n"
             f"• קלנדר: חברו גוגל → {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
-            "• המלצות: שלחו לינקים/מקומות; שליפה לפי עיר/קטגוריה (למשל: 'המלצות לקופנגן חופים')\n"
-            "• /reset לאיפוס שיחה"
+            "• המלצות: שלחו לינקים/מקומות; שליפה לפי עיר/קטגוריה\n"
+            "• /reset לאיפוס שיחה\n"
+            "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'"
         )
     return None
 
@@ -814,7 +924,7 @@ def twilio_webhook():
     if not _validated_twilio_request():
         abort(403)
     from_ = request.form.get("From", "")
-    waid = request.form.get("WaId", from_)
+    waid = request.form.get("WaId", from_) or from_
     body = request.form.get("Body", "") or ""
     num_media = int(request.form.get("NumMedia", "0") or 0)
     latitude = request.form.get("Latitude")
@@ -835,11 +945,53 @@ def twilio_webhook():
     if body or (latitude and longitude):
         store_recommendation_if_relevant(waid, body, latitude, longitude)
 
-    # פקודות
+    # פקודות טכניות
     cmd_reply = handle_commands(body, waid)
     if cmd_reply:
         for ch in chunk_text(cmd_reply): resp.message(ch)
         return str(resp)
+
+    # === FLIGHT WATCH – ניהול בפקודות וואטסאפ ===
+    track_iata, track_date, is_track_cmd = _fw_parse_track(body)
+    if is_track_cmd:
+        if not track_iata:
+            resp.message("צריך לציין מזהה טיסה, למשל: 'עקוב אחרי טיסה LY7 2025-09-25'.")
+            return str(resp)
+        db = get_db()
+        db.execute(
+            "INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
+            (waid, track_iata, track_date, "aviationstack", None, None)
+        )
+        db.commit()
+        resp.message(f"מעולה! עוקב אחרי הטיסה {track_iata}" + (f" לתאריך {track_date}" if track_date else "") + ". אעדכן כשיהיו שינויים.")
+        return str(resp)
+
+    to_untrack = _fw_parse_untrack(body)
+    if to_untrack:
+        db = get_db()
+        if to_untrack == "__ALL__":
+            db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
+            n = db.total_changes
+        else:
+            db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, to_untrack))
+            n = db.total_changes
+        db.commit()
+        resp.message("בוטל מעקב" + (f" אחרי {to_untrack}" if to_untrack != "__ALL__" else " לכל הטיסות") + f" ({n} רשומות).")
+        return str(resp)
+
+    if _fw_is_list(body):
+        db = get_db()
+        rows = db.execute("SELECT id, flight_iata, flight_date, created_at FROM flight_watch WHERE waid=? ORDER BY id DESC", (waid,)).fetchall()
+        if not rows:
+            resp.message("אין מנויים פעילים כרגע.")
+            return str(resp)
+        lines = [f"✈️ רשימת מנויים ({len(rows)}):"]
+        for r in rows:
+            lines.append(f"#{r['id']} {r['flight_iata']}" + (f" {r['flight_date']}" if r['flight_date'] else "") + f" (מ־{r['created_at']})")
+        for ch in chunk_text("\n".join(lines)): resp.message(ch)
+        return str(resp)
+
+    # ---- המשך היכולות הקיימות ----
 
     user_text = body.strip()
     if latitude and longitude:
@@ -854,7 +1006,7 @@ def twilio_webhook():
 
     intent = detect_intent(user_text)
 
-    # חיפוש טיסות
+    # חיפוש טיסות (קישורים)
     if intent == "flight_search":
         airports = detect_airports(user_text)
         dates = parse_dates(user_text)
@@ -898,7 +1050,6 @@ def twilio_webhook():
 
     # המלצות לפי עיר + קטגוריה
     if intent == "recs_query":
-        # דוגמה: "המלצות לקופנגן חופים" → עיר=קופנגן, קטגוריה=חוף
         city = extract_city_tag(user_text)
         cat = infer_category(user_text)
         db = get_db()
@@ -948,7 +1099,7 @@ def twilio_webhook():
     for ch in chunk_text(answer): resp.message(ch)
     return str(resp)
 
-# ------------------------- Cron -------------------------
+# ------------------------- Cron (קיים) -------------------------
 def require_cron_secret():
     key = request.args.get("key")
     if key != CRON_SECRET:
@@ -1002,6 +1153,46 @@ def cron_weekly():
         send_whatsapp(waid, "\n".join(lines))
         total += 1
     return jsonify(ok=True, sent=total)
+
+# ------------------------- === FLIGHT WATCH === Cron -------------------------
+@app.route("/cron/flight_watch", methods=["GET"])
+def cron_flight_watch():
+    require_cron_secret()
+    if not AVIATIONSTACK_KEY:
+        return jsonify({"ok": False, "error": "Missing AVIATIONSTACK_KEY"}), 500
+
+    db = get_db()
+    rows = db.execute("SELECT * FROM flight_watch ORDER BY id").fetchall()
+    total = len(rows); changes = 0; notified = 0
+
+    for s in rows:
+        fi = s["flight_iata"]
+        fd = s["flight_date"]
+        res = _fw_fetch_aviationstack(fi, fd)
+        if res.get("error"):
+            logger.error("aviationstack error: %s", res["error"])
+            continue
+        data = res.get("data") or []
+        if not data:
+            logger.info("no data for %s %s", fi, fd or "")
+            continue
+
+        rec = data[0]
+        snap = _fw_snapshot_from_aviationstack(rec)
+        h = _fw_snapshot_hash(snap)
+
+        if not s["last_hash"] or s["last_hash"] != h:
+            db.execute(
+                "UPDATE flight_watch SET last_snapshot=?, last_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(snap, ensure_ascii=False), h, s["id"])
+            )
+            db.commit()
+            changes += 1
+            msg = "עדכון טיסה חדש:\n" + _fw_format_message(snap)
+            _fw_send_to_all(s["waid"], msg)
+            notified += 1 + len(NOTIFY_CC_WAIDS)
+
+    return jsonify({"ok": True, "subscriptions": total, "changes": changes, "notifications_attempted": notified})
 
 # ------------------------- Main -------------------------
 if __name__ == "__main__":
