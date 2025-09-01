@@ -350,14 +350,15 @@ def detect_airports(text: str) -> Dict[str, Optional[str]]:
     return {"origin": origin, "dest": dest}
 
 # ------------------------- Vision/AI חילוץ נתונים -------------------------
+# 1) החלף את ai_extract_booking_from_text כך שיחלץ flights[]
 def ai_extract_booking_from_text(text: str) -> Dict[str, dict]:
     if not openai_client:
         return {}
     prompt = (
-        "Extract booking details only if present. Return strict JSON with keys 'flight' and 'hotel'. "
-        "flight: {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr}. "
-        "hotel: {hotel_name,city,checkin_date,checkout_date,address}. "
-        "Use ISO dates YYYY-MM-DD and HH:MM 24h. Fill only available fields."
+        "Extract flight and hotel details from booking text.\n"
+        "Return STRICT JSON: { flights: [ {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr} ],"
+        "  hotels: [ {hotel_name,city,checkin_date,checkout_date,address} ] }.\n"
+        "Dates in YYYY-MM-DD, times HH:MM 24h. Fill only known fields. If nothing, return empty arrays."
     )
     try:
         r = openai_client.chat.completions.create(
@@ -365,48 +366,91 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, dict]:
             messages=[{"role":"system","content":prompt},{"role":"user","content":text[:8000]}],
             temperature=0.0, timeout=25,
         )
-        content = (r.choices[0].message.content or "").strip()
-        s = content
-        start, end = s.find("{"), s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            s = s[start:end+1]
-        return json.loads(s)
-    except openai.RateLimitError:
-        return {}
+        s = (r.choices[0].message.content or "").strip()
+        s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
+        obj = json.loads(s)
+        # נורמליזציה לאחור אם המודל החזיר מפתח יחיד 'flight'/'hotel'
+        if "flights" not in obj:
+            f = obj.get("flight")
+            obj["flights"] = [f] if isinstance(f, dict) else []
+        if "hotels" not in obj:
+            h = obj.get("hotel")
+            obj["hotels"] = [h] if isinstance(h, dict) else []
+        return obj
     except Exception:
-        return {}
+        return {"flights": [], "hotels": []}
 
-def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, dict]:
-    if not openai_client:
-        return {}
-    try:
-        messages = [
-            {"role":"system","content":"You read images of tickets/hotel confirmations and return strict JSON as specified."},
-            {"role":"user","content":[
-                {"type":"text","text":
-                 ("Extract booking details if present. Return JSON with keys 'flight' and 'hotel' as in: "
-                  "flight:{origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr}; "
-                  "hotel:{hotel_name,city,checkin_date,checkout_date,address}. "
-                  "Dates=YYYY-MM-DD, Times=HH:MM. Fill only existing fields. ") + (hint or "")},
-                {"type":"image_url","image_url":{"url": image_url}}
-            ]}
-        ]
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.0,
-            timeout=30,
+
+# 2) עדכן את index_booking_from_text כך שישמור כמה טיסות
+def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str], raw_excerpt: str):
+    db = get_db()
+
+    # קודם נסה זיהוי "נאיבי" לטיסה אחת (למקרה שאין OpenAI)
+    naive_flight = None
+    found_dates = parse_dates(text)
+    found_times = parse_times(text)
+    airports = detect_airports(text)
+    if airports["dest"]:
+        naive_flight = {
+            "origin": airports["origin"], "dest": airports["dest"],
+            "depart_date": (found_dates[0] if found_dates else None),
+            "depart_time": (found_times[0] if found_times else None),
+            "arrival_date": None, "arrival_time": None,
+            "airline": None, "flight_number": None, "pnr": None,
+        }
+
+    ai = ai_extract_booking_from_text(text) if openai_client else {"flights": [], "hotels": []}
+    flights = ai.get("flights") or []
+    hotels = ai.get("hotels") or []
+
+    # אם אין תוצאה מה-AI ויש זיהוי נאיבי — נשמור אחת
+    if not flights and naive_flight and naive_flight.get("dest") and naive_flight.get("depart_date"):
+        flights = [naive_flight]
+
+    # שמירת כל הטיסות שמצאנו
+    for fl in flights:
+        if not fl or not fl.get("dest") or not fl.get("depart_date"):
+            continue
+        fid = uuid.uuid4().hex
+        db.execute(
+            """INSERT INTO flights
+               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,source_file_id,raw_excerpt,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fid, waid, fl.get("origin"), fl.get("dest"),
+             fl.get("depart_date"), fl.get("depart_time"),
+             fl.get("arrival_date"), fl.get("arrival_time"),
+             fl.get("airline"), fl.get("flight_number"),
+             fl.get("pnr"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
         )
-        content = (r.choices[0].message.content or "").strip()
-        s = content
-        start, end = s.find("{"), s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            s = s[start:end+1]
-        return json.loads(s)
-    except openai.RateLimitError:
-        return {}
-    except Exception:
-        return {}
+        # אירוע לקלנדר (אם מחובר)
+        start_iso = to_dt_iso(fl.get("depart_date"), fl.get("depart_time"))
+        if start_iso:
+            summary = f"✈️ {fl.get('origin') or ''}→{fl.get('dest') or ''} {fl.get('flight_number') or ''}".strip()
+            desc = f"Airline: {fl.get('airline') or ''}\nPNR: {fl.get('pnr') or ''}"
+            add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
+
+    # שמירת כל מלונות (אם קיימים)
+    for ho in hotels:
+        if not ho or not ho.get("checkin_date"):
+            continue
+        hid = uuid.uuid4().hex
+        db.execute(
+            """INSERT INTO hotels
+               (id,waid,hotel_name,city,checkin_date,checkout_date,address,source_file_id,raw_excerpt,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (hid, waid, ho.get("hotel_name"), ho.get("city"),
+             ho.get("checkin_date"), ho.get("checkout_date"),
+             ho.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
+        )
+        add_calendar_event(
+            waid,
+            f"🏨 Check-in: {ho.get('hotel_name') or ''}",
+            f"City: {ho.get('city') or ''}\nAddress: {ho.get('address') or ''}",
+            ho.get("checkin_date"), ho.get("checkout_date") or ho.get("checkin_date"),
+            all_day=True
+        )
+    db.commit()
+
 
 # ------------------------- Calendar (Google) -------------------------
 def get_google_flow() -> Optional[Flow]:
