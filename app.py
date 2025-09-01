@@ -5,7 +5,7 @@ WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Go
 
 יכולות:
 - שיחה חופשית (GPT כשזמין; אחרת Fallback)
-- קבלת מדיה בוואטסאפ, שמירה וניתוח (PDF/תמונה) → Flights/Hotels
+- קבלת מדיה בוואטסאפ, שמירה וניתוח (PDF/תמונה) → Flights/Hotels + סיכום אוטומטי
 - שליחה חוזרת של קבצים ("שלח לי את הכרטיס")
 - חיפוש טיסות (לינקים)
 - פיד ICS אישי: /calendar/<WaId>.ics
@@ -13,34 +13,34 @@ WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Go
 - Google Calendar OAuth: הוספת אירועים אוטומטית ליומן
 - Vision לתמונות: חילוץ פרטי טיסה/מלון מתמונה
 - המלצות לפי עיר + קטגוריה
-- === FLIGHT WATCH === מעקב טיסות חינמי: פקודות וואטסאפ (“עקוב אחרי טיסה …”, “בטל …”, “רשימה”), Cron לבדיקה ושליחת התראות
+- === FLIGHT WATCH === מעקב טיסות חינמי: פקודות (“עקוב אחרי טיסה …”, “בטל …”, “רשימה”), Cron והתראות
 
 ENV (Render → Environment):
 OPENAI_API_KEY
 OPENAI_MODEL                (default: gpt-4o-mini)
 SYSTEM_PROMPT               (optional)
 VERIFY_TWILIO_SIGNATURE     ('false' default)
-TWILIO_AUTH_TOKEN           (נדרש לאימות חתימה ולהורדת מדיה)
-TWILIO_ACCOUNT_SID          (נדרש להורדת/שליחת מדיה)
-TWILIO_WHATSAPP_FROM        ('whatsapp:+1415...' או מספר וואטסאפ פעיל) או TWILIO_MESSAGING_SERVICE_SID
-BASE_PUBLIC_URL             (e.g. https://thailand2025.onrender.com)
-CRON_SECRET                 (סיסמה ל-/cron/*)
-TZ                          (e.g. Asia/Jerusalem)
+TWILIO_AUTH_TOKEN
+TWILIO_ACCOUNT_SID
+TWILIO_WHATSAPP_FROM        (או TWILIO_MESSAGING_SERVICE_SID)
+BASE_PUBLIC_URL
+CRON_SECRET
+TZ
 
 # Google OAuth (Calendar)
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
-GOOGLE_OAUTH_REDIRECT_URI   (e.g. https://<domain>/google/oauth/callback)
+GOOGLE_OAUTH_REDIRECT_URI
 
 # === FLIGHT WATCH ===
-AVIATIONSTACK_KEY           (מפתח חינמי לסטטוס טיסות)
-NOTIFY_CC_WAIDS            (אופציונלי: whatsapp:+9725...,whatsapp:+9725...)
+AVIATIONSTACK_KEY
+NOTIFY_CC_WAIDS
 
 Start command (Render):
 gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
 """
 
-import os, re, time, uuid, sqlite3, logging, json, mimetypes, hmac, hashlib, base64
+import os, re, time, uuid, sqlite3, logging, json, mimetypes, hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -274,7 +274,7 @@ CITY_MAP = {
     "קוסמוי": "USM", "koh samui": "USM", "סמוי": "USM",
     "קראבי": "KBV", "krabi": "KBV",
     "תל אביב": "TLV", "tel aviv": "TLV", "נתבג": "TLV", "נתב\"ג": "TLV", "israel": "TLV",
-    "קופנגן": "KOPH", "koh phangan": "KOPH",  # תגית לעיר/אי (לא IATA)
+    "קופנגן": "KOPH", "koh phangan": "KOPH",
 }
 
 DATE_PATTERNS = [
@@ -653,11 +653,14 @@ def store_recommendation_if_relevant(waid: str, text: str, lat: Optional[str], l
 FLIGHT_WORDS = ["flight","flights","טיסה","טיסות","כרטיס טיסה","הזמנת טיסה","find flight","book flight"]
 RECO_WORDS = ["המלצות","recommendations","places","מה כדאי","לאן ללכת","מסעדות","ברים","חופים","קפה","אטרקציות"]
 SEND_FILE_WORDS = ["שלח","תשלח","send","הכרטיס","pdf","כרטיס טיסה","ticket","boarding"]
+MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטיסה שלי", "פרטי הטיסה", "flight details", "my flight"]
 
 def detect_intent(text: str) -> str:
     t = (text or "").lower()
     if any(w in t for w in FLIGHT_WORDS):
         return "flight_search"
+    if any(w in t for w in MY_FLIGHT_WORDS):
+        return "my_flight"
     if "ics" in t and "calendar" in t:
         return "calendar_link"
     if any(w in t for w in RECO_WORDS):
@@ -697,7 +700,7 @@ def _fw_parse_untrack(text: str):
     if not any(k in (text or "").lower() for k in ["בטל", "unsubscribe", "untrack", "הסר"]):
         return None
     m = IATA_RE.search((text or "").upper())
-    return m.group(1).upper() if m else "__ALL__"  # מאפשר "בטל" בלי מזהה למחיקת הכל
+    return m.group(1).upper() if m else "__ALL__"
 
 def _fw_is_list(text: str):
     return any(k in (text or "").lower() for k in ["רשימה", "list flights", "list"])
@@ -911,11 +914,12 @@ def handle_commands(body: str, waid: str) -> Optional[str]:
         return (
             "ℹ️ אני יודע:\n"
             "• חיפוש טיסות: 'תמצא לי טיסה לפוקט ב-2025-09-12'\n"
-            "• שליחת קובץ: שלחו PDF/תמונה – אני אשמור. 'שלח לי את הכרטיס'\n"
+            "• שליחת קובץ: שלחו PDF/תמונה – אשמור ואחלץ פרטי נסיעה. 'שלח לי את הכרטיס'\n"
             f"• קלנדר: חברו גוגל → {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
             "• המלצות: שלחו לינקים/מקומות; שליפה לפי עיר/קטגוריה\n"
             "• /reset לאיפוס שיחה\n"
-            "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'"
+            "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'\n"
+            "• 'מה הטיסה שלי' – להצגת הטיסה הקרובה שנמצאה"
         )
     return None
 
@@ -934,12 +938,46 @@ def twilio_webhook():
 
     resp = MessagingResponse()
 
-    # מדיה נכנסת – שמירה ואינדוקס
+    # מדיה נכנסת – שמירה, אינדוקס + סיכום מיידי
     saved_media = []
     if num_media > 0:
         saved_media = handle_incoming_media(waid, num_media, body)
         if saved_media:
-            resp.message(f"📎 שמרתי {len(saved_media)} קבצים. כתבו 'שלח לי את הכרטיס' לקבלת האחרון.")
+            resp.message(f"📎 שמרתי {len(saved_media)} קבצים.")
+            try:
+                db = get_db()
+                fl = db.execute("""
+                    SELECT origin,dest,depart_date,depart_time,airline,flight_number
+                    FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 1
+                """, (waid,)).fetchone()
+                ho = db.execute("""
+                    SELECT hotel_name,city,checkin_date,checkout_date
+                    FROM hotels WHERE waid=? ORDER BY created_at DESC LIMIT 1
+                """, (waid,)).fetchone()
+
+                if fl and fl["depart_date"]:
+                    line = (
+                        f"✈️ מצאתי טיסה: "
+                        f"{(fl['origin'] or '')}→{(fl['dest'] or '')} "
+                        f"{fl['flight_number'] or ''} "
+                        f"{fl['depart_date']} {fl['depart_time'] or ''}"
+                        f"{(' | ' + fl['airline']) if fl['airline'] else ''}"
+                    ).strip()
+                    resp.message(line)
+
+                if ho and ho["checkin_date"]:
+                    line = (
+                        f"🏨 מצאתי הזמנת מלון: {ho['hotel_name'] or 'מלון'} "
+                        f"({ho['city'] or ''}) {ho['checkin_date']}–{ho['checkout_date'] or ho['checkin_date']}"
+                    ).strip()
+                    resp.message(line)
+
+                if (not fl or not fl['depart_date']) and (not ho or not ho['checkin_date']):
+                    resp.message("ניסיתי לחלץ פרטים מהקובץ. אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסה שלי'.")
+            except Exception as e:
+                logger.exception("Post-media summary failed: %s", e)
+                resp.message("שמרתי את הקובץ. אפשר לכתוב: 'מה הטיסה שלי' או 'שלח לי את הכרטיס'.")
+            return str(resp)
 
     # המלצות/מיקום – נשמור
     if body or (latitude and longitude):
@@ -951,7 +989,7 @@ def twilio_webhook():
         for ch in chunk_text(cmd_reply): resp.message(ch)
         return str(resp)
 
-    # === FLIGHT WATCH – ניהול בפקודות וואטסאפ ===
+    # === FLIGHT WATCH – פקודות וואטסאפ ===
     track_iata, track_date, is_track_cmd = _fw_parse_track(body)
     if is_track_cmd:
         if not track_iata:
@@ -991,8 +1029,7 @@ def twilio_webhook():
         for ch in chunk_text("\n".join(lines)): resp.message(ch)
         return str(resp)
 
-    # ---- המשך היכולות הקיימות ----
-
+    # ---- שאר היכולות ----
     user_text = body.strip()
     if latitude and longitude:
         loc = f"[location] lat={latitude}, lon={longitude} | {label or address or ''}"
@@ -1001,10 +1038,37 @@ def twilio_webhook():
     if not user_text and saved_media:
         return str(resp)
     if not user_text:
-        resp.message("👋 כתבו: 'תמצא טיסה לפוקט' / 'שלח לי את הכרטיס' / '/help'.")
+        resp.message("👋 כתבו: 'תמצא טיסה לפוקט' / 'מה הטיסה שלי' / 'שלח לי את הכרטיס' / '/help'.")
         return str(resp)
 
     intent = detect_intent(user_text)
+
+    # "מה הטיסה שלי" – הטיסה הקרובה/האחרונה שנמצאה
+    if intent == "my_flight":
+        db = get_db()
+        row = db.execute("""
+            SELECT origin,dest,depart_date,depart_time,airline,flight_number
+            FROM flights
+            WHERE waid=? AND depart_date IS NOT NULL
+            ORDER BY depart_date ASC, IFNULL(depart_time,'23:59') ASC
+            LIMIT 1
+        """, (waid,)).fetchone()
+        if not row:
+            row = db.execute("""
+                SELECT origin,dest,depart_date,depart_time,airline,flight_number
+                FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 1
+            """, (waid,)).fetchone()
+        if not row:
+            resp.message("לא מצאתי טיסה שמורה. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים.")
+            return str(resp)
+        msg = (
+            f"✈️ {row['origin'] or ''}→{row['dest'] or ''} "
+            f"{row['flight_number'] or ''} "
+            f"{row['depart_date'] or ''} {row['depart_time'] or ''}"
+            f"{(' | ' + row['airline']) if row['airline'] else ''}"
+        ).strip()
+        resp.message(msg)
+        return str(resp)
 
     # חיפוש טיסות (קישורים)
     if intent == "flight_search":
