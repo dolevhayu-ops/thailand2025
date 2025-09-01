@@ -3,7 +3,7 @@ gunicorn>=21.2.0
 twilio>=9.0.0
 openai>=1.40.0
 requests>=2.31.0
-pypdf>=3.12.0
+pypdf==4.2.0
 
 # Google Calendar / OAuth
 google-api-python-client>=2.131.0
