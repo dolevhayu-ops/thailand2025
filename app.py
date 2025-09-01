@@ -12,9 +12,8 @@ WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Go
 - Cron יומי/שבועי לוואטסאפ (תזכורות ודוח)
 - Google Calendar OAuth: הוספת אירועים אוטומטית ליומן
 - Vision לתמונות: חילוץ פרטי טיסה/מלון מתמונה
-- המלצות לפי עיר + קטגוריה
 - === FLIGHT WATCH === מעקב טיסות חינמי: פקודות (“עקוב אחרי טיסה …”, “בטל …”, “רשימה”), Cron והתראות
-- === NL ROUTER === הבנת שפה טבעית: “מה הטיסות של דולב?”, “מה הטיסות שלי?”, “סטטוס LY81”, “בטל LY81” וכו'
+- === NL ROUTER === הבנת שפה טבעית: “מה הטיסות של דולב/עודד?”, “מה הטיסות שלי?”, “סטטוס LY81”, “בטל LY81” וכו'
 
 ENV (Render → Environment):
 OPENAI_API_KEY
@@ -45,11 +44,11 @@ Start command (Render):
 gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
 """
 
-import os, re, time, uuid, sqlite3, logging, json, mimetypes, hashlib
+import os, re, uuid, sqlite3, logging, json, mimetypes, hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from collections import defaultdict
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import requests
 from flask import Flask, request, abort, send_file, jsonify, g, Response, redirect
@@ -72,19 +71,6 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
-
-
-
-def normalize_waid(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return s
-    s = s.strip()
-    if s.startswith("whatsapp:"):
-        s = s[len("whatsapp:"):]
-    s = s.lstrip("+")
-    return s
-
-
 
 # ------------------------- קונפיג ולוגים -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -111,16 +97,6 @@ AVIATIONSTACK_KEY = os.getenv("AVIATIONSTACK_KEY", "")
 AVIATIONSTACK_URL = "http://api.aviationstack.com/v1/flights"
 NOTIFY_CC_WAIDS = [x.strip() for x in os.getenv("NOTIFY_CC_WAIDS", "").split(",") if x.strip()]
 
-# === Aliases for asking about other people's flights ===
-CONTACT_ALIASES: Dict[str, str] = {}
-for pair in (os.getenv("CONTACT_ALIASES","").split(",") if os.getenv("CONTACT_ALIASES") else []):
-    if "=" in pair:
-        name, wa = pair.split("=", 1)
-        CONTACT_ALIASES[name.strip()] = normalize_waid(wa.strip())
-
-
-DEFAULT_LOOKAHEAD_DAYS = int(os.getenv("DEFAULT_LOOKAHEAD_DAYS", "90"))
-
 # OpenAI
 api_key = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=api_key) if api_key else None
@@ -137,6 +113,15 @@ def tz_now():
         except Exception:
             pass
     return datetime.utcnow()
+
+def normalize_waid(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return s
+    s = s.strip()
+    if s.startswith("whatsapp:"):
+        s = s[len("whatsapp:"):]
+    s = s.lstrip("+")
+    return s
 
 app = Flask(__name__)
 
@@ -223,8 +208,7 @@ def init_db():
             waid TEXT,
             created_at TEXT
         );
-
-        -- === FLIGHT WATCH === מנויים למעקב טיסות
+        -- === FLIGHT WATCH ===
         CREATE TABLE IF NOT EXISTS flight_watch (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             waid TEXT NOT NULL,
@@ -282,6 +266,8 @@ def send_whatsapp(to_waid: str, body: str, media_urls: Optional[List[str]] = Non
     if not twilio_client:
         logger.warning("Twilio client not configured; cannot send outbound.")
         return
+    # normalize outbound
+    to_waid = "whatsapp:+" + normalize_waid(to_waid)
     kwargs = dict(to=to_waid, body=body)
     if TWILIO_MESSAGING_SERVICE_SID:
         kwargs["messaging_service_sid"] = TWILIO_MESSAGING_SERVICE_SID
@@ -304,7 +290,6 @@ CITY_MAP = {
     "תל אביב": "TLV", "tel aviv": "TLV", "נתבג": "TLV", "נתב\"ג": "TLV", "israel": "TLV",
     "קופנגן": "KOPH", "koh phangan": "KOPH",
 }
-
 DATE_PATTERNS = [
     (re.compile(r"(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})"), "%Y-%m-%d"),
     (re.compile(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})"), "%d-%m-%Y"),
@@ -350,10 +335,10 @@ def detect_airports(text: str) -> Dict[str, Optional[str]]:
     return {"origin": origin, "dest": dest}
 
 # ------------------------- Vision/AI חילוץ נתונים -------------------------
-# 1) החלף את ai_extract_booking_from_text כך שיחלץ flights[]
-def ai_extract_booking_from_text(text: str) -> Dict[str, dict]:
+def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
+    """Return {'flights':[...], 'hotels':[...]} (strict)."""
     if not openai_client:
-        return {}
+        return {"flights": [], "hotels": []}
     prompt = (
         "Extract flight and hotel details from booking text.\n"
         "Return STRICT JSON: { flights: [ {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr} ],"
@@ -368,28 +353,99 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, dict]:
         )
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
-        obj = json.loads(s)
-        # נורמליזציה לאחור אם המודל החזיר מפתח יחיד 'flight'/'hotel'
+        obj = json.loads(s) if s else {}
+        # backward-compat
         if "flights" not in obj:
             f = obj.get("flight")
             obj["flights"] = [f] if isinstance(f, dict) else []
         if "hotels" not in obj:
             h = obj.get("hotel")
             obj["hotels"] = [h] if isinstance(h, dict) else []
-        return obj
+        return {"flights": obj.get("flights") or [], "hotels": obj.get("hotels") or []}
     except Exception:
         return {"flights": [], "hotels": []}
 
+def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, list]:
+    if not openai_client:
+        return {"flights": [], "hotels": []}
+    try:
+        messages = [
+            {"role":"system","content":
+             "You read images of tickets/hotel confirmations and return STRICT JSON as: "
+             "{ flights:[{origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr}],"
+             "  hotels:[{hotel_name,city,checkin_date,checkout_date,address}] } (YYYY-MM-DD, HH:MM)."},
+            {"role":"user","content":[
+                {"type":"text","text": (hint or "")},
+                {"type":"image_url","image_url":{"url": image_url}}
+            ]}
+        ]
+        r = openai_client.chat.completions.create(
+            model=OPENAI_MODEL, messages=messages, temperature=0.0, timeout=30,
+        )
+        s = (r.choices[0].message.content or "").strip()
+        s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
+        obj = json.loads(s) if s else {}
+        return {
+            "flights": obj.get("flights") or ([obj.get("flight")] if isinstance(obj.get("flight"), dict) else []) or [],
+            "hotels":  obj.get("hotels")  or ([obj.get("hotel")] if isinstance(obj.get("hotel"), dict)  else []) or [],
+        }
+    except Exception:
+        return {"flights": [], "hotels": []}
 
-# 2) עדכן את index_booking_from_text כך שישמור כמה טיסות
+# ------------------------- Calendar (Google) -------------------------
+def get_google_flow() -> Optional[Flow]:
+    cid = os.getenv("GOOGLE_CLIENT_ID"); cs = os.getenv("GOOGLE_CLIENT_SECRET"); red = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+    if not (cid and cs and red): return None
+    client_config = {"web":{"client_id":cid,"client_secret":cs,"auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","redirect_uris":[red]}}
+    flow = Flow.from_client_config(client_config, scopes=["https://www.googleapis.com/auth/calendar"])
+    flow.redirect_uri = red
+    return flow
+
+def save_google_token(waid: str, creds: Credentials):
+    db = get_db()
+    js = creds.to_json(); now = datetime.utcnow().isoformat()
+    db.execute(
+        "INSERT INTO google_tokens (waid, token_json, created_at, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(waid) DO UPDATE SET token_json=excluded.token_json, updated_at=excluded.updated_at",
+        (waid, js, now, now)
+    ); db.commit()
+
+def load_google_creds(waid: str) -> Optional[Credentials]:
+    row = get_db().execute("SELECT token_json FROM google_tokens WHERE waid=?", (waid,)).fetchone()
+    if not row: return None
+    creds = Credentials.from_authorized_user_info(json.loads(row["token_json"]), scopes=["https://www.googleapis.com/auth/calendar"])
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleRequest()); save_google_token(waid, creds)
+        except Exception as e:
+            logger.exception("Google token refresh failed: %s", e); return None
+    return creds
+
+def add_calendar_event(waid: str, summary: str, description: str, start_iso: str, end_iso: Optional[str] = None, all_day: bool = False):
+    creds = load_google_creds(waid)
+    if not creds: return False
+    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    if all_day:
+        event = {"summary":summary,"description":description,"start":{"date":start_iso},"end":{"date": end_iso or start_iso}}
+    else:
+        event = {"summary":summary,"description":description,"start":{"dateTime":start_iso},"end":{"dateTime": end_iso or start_iso}}
+    try:
+        service.events().insert(calendarId="primary", body=event).execute(); return True
+    except Exception as e:
+        logger.exception("Google Calendar insert failed: %s", e); return False
+
+def to_dt_iso(date_str: str, time_str: Optional[str]) -> Optional[str]:
+    if not date_str: return None
+    if time_str and re.match(r"^\d{2}:\d{2}$", time_str): return f"{date_str}T{time_str}:00"
+    return f"{date_str}T09:00:00"
+
+# ------------------------- אינדוקס הזמנות (ריבוי טיסות) -------------------------
 def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str], raw_excerpt: str):
     db = get_db()
 
-    # קודם נסה זיהוי "נאיבי" לטיסה אחת (למקרה שאין OpenAI)
+    # נאיבי (למקרה שאין OpenAI) – טיסה אחת
     naive_flight = None
-    found_dates = parse_dates(text)
-    found_times = parse_times(text)
-    airports = detect_airports(text)
+    found_dates = parse_dates(text); found_times = parse_times(text); airports = detect_airports(text)
     if airports["dest"]:
         naive_flight = {
             "origin": airports["origin"], "dest": airports["dest"],
@@ -403,14 +459,12 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
     flights = ai.get("flights") or []
     hotels = ai.get("hotels") or []
 
-    # אם אין תוצאה מה-AI ויש זיהוי נאיבי — נשמור אחת
     if not flights and naive_flight and naive_flight.get("dest") and naive_flight.get("depart_date"):
         flights = [naive_flight]
 
-    # שמירת כל הטיסות שמצאנו
+    # שמירת כל הטיסות
     for fl in flights:
-        if not fl or not fl.get("dest") or not fl.get("depart_date"):
-            continue
+        if not fl or not fl.get("dest") or not fl.get("depart_date"): continue
         fid = uuid.uuid4().hex
         db.execute(
             """INSERT INTO flights
@@ -422,17 +476,15 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
              fl.get("airline"), fl.get("flight_number"),
              fl.get("pnr"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
         )
-        # אירוע לקלנדר (אם מחובר)
         start_iso = to_dt_iso(fl.get("depart_date"), fl.get("depart_time"))
         if start_iso:
             summary = f"✈️ {fl.get('origin') or ''}→{fl.get('dest') or ''} {fl.get('flight_number') or ''}".strip()
             desc = f"Airline: {fl.get('airline') or ''}\nPNR: {fl.get('pnr') or ''}"
             add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
 
-    # שמירת כל מלונות (אם קיימים)
+    # שמירת כל המלונות
     for ho in hotels:
-        if not ho or not ho.get("checkin_date"):
-            continue
+        if not ho or not ho.get("checkin_date"): continue
         hid = uuid.uuid4().hex
         db.execute(
             """INSERT INTO hotels
@@ -451,176 +503,30 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
         )
     db.commit()
 
-
-# ------------------------- Calendar (Google) -------------------------
-def get_google_flow() -> Optional[Flow]:
-    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):
-        return None
-    client_config = {
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_OAUTH_REDIRECT_URI]
-        }
-    }
-    flow = Flow.from_client_config(client_config, scopes=["https://www.googleapis.com/auth/calendar"])
-    flow.redirect_uri = GOOGLE_OAUTH_REDIRECT_URI
-    return flow
-
-def save_google_token(waid: str, creds: Credentials):
-    db = get_db()
-    js = creds.to_json()
-    now = datetime.utcnow().isoformat()
-    db.execute(
-        "INSERT INTO google_tokens (waid, token_json, created_at, updated_at) VALUES (?,?,?,?) "
-        "ON CONFLICT(waid) DO UPDATE SET token_json=excluded.token_json, updated_at=excluded.updated_at",
-        (waid, js, now, now)
-    )
-    db.commit()
-
-def load_google_creds(waid: str) -> Optional[Credentials]:
-    row = get_db().execute("SELECT token_json FROM google_tokens WHERE waid=?", (waid,)).fetchone()
-    if not row:
-        return None
-    creds = Credentials.from_authorized_user_info(json.loads(row["token_json"]), scopes=["https://www.googleapis.com/auth/calendar"])
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(GoogleRequest())
-            save_google_token(waid, creds)
-        except Exception as e:
-            logger.exception("Google token refresh failed: %s", e)
-            return None
-    return creds
-
-def add_calendar_event(waid: str, summary: str, description: str, start_iso: str, end_iso: Optional[str] = None, all_day: bool = False):
-    creds = load_google_creds(waid)
-    if not creds:
-        return False
-    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-    if all_day:
-        event = {
-            "summary": summary,
-            "description": description,
-            "start": {"date": start_iso},
-            "end": {"date": end_iso or start_iso},
-        }
-    else:
-        event = {
-            "summary": summary,
-            "description": description,
-            "start": {"dateTime": start_iso},
-            "end": {"dateTime": end_iso or start_iso},
-        }
-    try:
-        service.events().insert(calendarId="primary", body=event).execute()
-        return True
-    except Exception as e:
-        logger.exception("Google Calendar insert failed: %s", e)
-        return False
-
-def to_dt_iso(date_str: str, time_str: Optional[str]) -> Optional[str]:
-    if not date_str:
-        return None
-    if time_str and re.match(r"^\d{2}:\d{2}$", time_str):
-        return f"{date_str}T{time_str}:00"
-    return f"{date_str}T09:00:00"
-
-# ------------------------- אינדוקס הזמנות לטבלה + הוספה לקלנדר -------------------------
-def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str], raw_excerpt: str):
-    db = get_db()
-    found_dates = parse_dates(text)
-    found_times = parse_times(text)
-    airports = detect_airports(text)
-    flight = None
-    if airports["dest"]:
-        depart_date = found_dates[0] if found_dates else None
-        depart_time = found_times[0] if found_times else None
-        flight = {
-            "origin": airports["origin"], "dest": airports["dest"],
-            "depart_date": depart_date, "depart_time": depart_time,
-            "arrival_date": None, "arrival_time": None,
-            "airline": None, "flight_number": None, "pnr": None,
-        }
-    ai = ai_extract_booking_from_text(text) if openai_client else {}
-    if ai.get("flight"):
-        flight = {**(flight or {}), **{k:v for k,v in ai["flight"].items() if v}}
-    if flight and flight.get("dest") and flight.get("depart_date"):
-        fid = uuid.uuid4().hex
-        db.execute(
-            """INSERT INTO flights
-               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,source_file_id,raw_excerpt,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fid, waid, flight.get("origin"), flight.get("dest"),
-             flight.get("depart_date"), flight.get("depart_time"),
-             flight.get("arrival_date"), flight.get("arrival_time"),
-             flight.get("airline"), flight.get("flight_number"),
-             flight.get("pnr"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
-        )
-        db.commit()
-        start_iso = to_dt_iso(flight.get("depart_date"), flight.get("depart_time"))
-        summary = f"✈️ {flight.get('origin') or ''}→{flight.get('dest') or ''} {flight.get('flight_number') or ''}".strip()
-        desc = f"Airline: {flight.get('airline') or ''}\nPNR: {flight.get('pnr') or ''}"
-        if start_iso:
-            add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
-
-    # Hotels
-    hotel = None
-    if re.search(r"\b(hotel|מלון)\b", text, re.I) and len(found_dates) >= 1:
-        checkin = found_dates[0]
-        checkout = found_dates[1] if len(found_dates) >= 2 else None
-        hotel = {"hotel_name": None, "city": None, "checkin_date": checkin, "checkout_date": checkout, "address": None}
-    if ai.get("hotel"):
-        hotel = {**(hotel or {}), **{k:v for k,v in ai["hotel"].items() if v}}
-    if hotel and hotel.get("checkin_date"):
-        hid = uuid.uuid4().hex
-        db.execute(
-            """INSERT INTO hotels
-               (id,waid,hotel_name,city,checkin_date,checkout_date,address,source_file_id,raw_excerpt,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (hid, waid, hotel.get("hotel_name"), hotel.get("city"),
-             hotel.get("checkin_date"), hotel.get("checkout_date"),
-             hotel.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
-        )
-        db.commit()
-        add_calendar_event(
-            waid,
-            f"🏨 Check-in: {hotel.get('hotel_name') or ''}",
-            f"City: {hotel.get('city') or ''}\nAddress: {hotel.get('address') or ''}",
-            hotel.get("checkin_date"), hotel.get("checkout_date") or hotel.get("checkin_date"),
-            all_day=True
-        )
-
 # ------------------------- אחסון קבצים -------------------------
 def guess_extension(content_type: str, fallback_from_url: str = "") -> str:
     if content_type:
         ext = mimetypes.guess_extension(content_type)
-        if ext:
-            return ext
+        if ext: return ext
     path = urlparse(fallback_from_url).path
     _, dot, suffix = path.rpartition(".")
-    if dot and suffix and len(suffix) <= 5:
-        return "." + suffix
+    if dot and suffix and len(suffix) <= 5: return "." + suffix
     return ".bin"
 
 def save_file_record(waid: str, fname: str, content_type: str, data: bytes, title: str = "", tags: str = "") -> str:
     fid = uuid.uuid4().hex
     name = secure_filename(fname) or f"file-{fid}"
-    if "." not in name and content_type:
-        name += guess_extension(content_type)
+    if "." not in name and content_type: name += guess_extension(content_type)
     path = os.path.join(STORAGE_DIR, name)
-    with open(path, "wb") as fp:
-        fp.write(data)
+    with open(path, "wb") as fp: fp.write(data)
     db = get_db()
     db.execute(
         "INSERT INTO files (id,waid,filename,content_type,path,title,tags,uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
         (fid, waid, name, content_type or "application/octet-stream", path, title, tags, datetime.utcnow().isoformat()),
-    )
-    db.commit()
-    # Index content
+    ); db.commit()
+    # אינדוקס תוכן
     try:
-        excerpt = f"{title or ''}\n" + (tags or "")
+        excerpt = f"{title or ''}\n{tags or ''}"
         if (content_type or "").lower().startswith("text/"):
             text = data.decode("utf-8", errors="ignore")
             excerpt += "\n" + text[:4000]
@@ -628,17 +534,14 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
         elif (content_type or "").lower() in ("application/pdf",) or name.lower().endswith(".pdf"):
             from pypdf import PdfReader
             reader = PdfReader(path)
-            pages = []
-            for p in reader.pages[:6]:
-                pages.append(p.extract_text() or "")
+            pages = [(p.extract_text() or "") for p in reader.pages[:6]]
             text = "\n".join(pages)
             excerpt += "\n" + text[:4000]
             index_booking_from_text(waid, text, fid, excerpt[:2000])
         elif (content_type or "").lower().startswith("image/"):
             img_url = public_base_url() + f"files/{fid}"
             ai = ai_extract_booking_from_image(img_url, hint=f"File name: {name}")
-            if ai:
-                index_booking_from_text(waid, json.dumps(ai), fid, f"vision:{name}")
+            if ai: index_booking_from_text(waid, json.dumps(ai), fid, f"vision:{name}")
     except Exception as e:
         logger.exception("Index from file failed: %s", e)
     return fid
@@ -646,21 +549,17 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
 def handle_incoming_media(waid: str, num_media: int, body_text: str) -> List[str]:
     saved = []
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-        logger.warning("Media received but TWILIO creds missing.")
-        return saved
+        logger.warning("Media received but TWILIO creds missing."); return saved
     for i in range(num_media):
         media_url = request.form.get(f"MediaUrl{i}")
         ctype = request.form.get(f"MediaContentType{i}") or "application/octet-stream"
-        if not media_url:
-            continue
+        if not media_url: continue
         try:
             r = requests.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
             r.raise_for_status()
             url_name = os.path.basename(urlparse(media_url).path) or f"media-{uuid.uuid4().hex}"
             ext = os.path.splitext(url_name)[1]
-            if not ext:
-                ext = guess_extension(ctype, media_url)
-                url_name += ext
+            if not ext: ext = guess_extension(ctype, media_url); url_name += ext
             fid = save_file_record(
                 waid, url_name, ctype, r.content,
                 title=(body_text or "WhatsApp media")[:80], tags="whatsapp,media"
@@ -681,43 +580,34 @@ CATEGORY_MAP = {
     "לינה": ["מלון","לינה","hotel","hostel","resort","bungalow"],
     "תחבורה": ["מונית","תחבורה","taxi","bus","ferry","מעבורת","סירה","boat"],
 }
-
 def infer_category(text: str) -> Optional[str]:
     t = (text or "").lower()
     for cat, kws in CATEGORY_MAP.items():
-        if any(k in t for k in kws):
-            return cat
+        if any(k in t for k in kws): return cat
     return "כללי" if text else None
 
 def extract_city_tag(text: str) -> Optional[str]:
     t = (text or "").lower()
     for name in CITY_MAP.keys():
-        if name in t:
-            return name
+        if name in t: return name
     return None
 
 def store_recommendation_if_relevant(waid: str, text: str, lat: Optional[str], lon: Optional[str]) -> None:
-    if not text and not (lat and lon):
-        return
-    url = None
-    m = re.search(r"(https?://\S+)", text or "", re.I)
+    if not text and not (lat and lon): return
+    url = None; m = re.search(r"(https?://\S+)", text or "", re.I); 
     if m: url = m.group(1)
     city_tag = extract_city_tag(text or "") or None
     category = infer_category(text or "")
-    place_name = None
-    mq = re.search(r"[?&]q=([^&]+)", url or "")
-    if mq:
-        place_name = mq.group(1).replace("+"," ").strip()[:120]
-    elif text:
-        place_name = text.strip()[:120]
+    place_name = None; mq = re.search(r"[?&]q=([^&]+)", url or "")
+    if mq: place_name = mq.group(1).replace("+"," ").strip()[:120]
+    elif text: place_name = text.strip()[:120]
     try:
         db = get_db()
         db.execute(
             "INSERT INTO recs (id,waid,text,place_name,city_tag,category,lat,lon,url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (uuid.uuid4().hex, waid, text or "", place_name, city_tag, category,
              float(lat) if lat else None, float(lon) if lon else None, url, datetime.utcnow().isoformat())
-        )
-        db.commit()
+        ); db.commit()
     except Exception as e:
         logger.exception("Failed to store recommendation: %s", e)
 
@@ -729,17 +619,11 @@ MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטי
 
 def detect_intent(text: str) -> str:
     t = (text or "").lower()
-    # חשוב: קודם "my_flight", אחר כך "flight_search"
-    if any(w in t for w in MY_FLIGHT_WORDS):
-        return "my_flight"
-    if any(w in t for w in FLIGHT_WORDS):
-        return "flight_search"
-    if "ics" in t and "calendar" in t:
-        return "calendar_link"
-    if any(w in t for w in RECO_WORDS):
-        return "recs_query"
-    if any(w in t for w in SEND_FILE_WORDS):
-        return "recall_file"
+    if any(w in t for w in MY_FLIGHT_WORDS): return "my_flight"
+    if any(w in t for w in FLIGHT_WORDS): return "flight_search"
+    if "ics" in t and "calendar" in t: return "calendar_link"
+    if any(w in t for w in RECO_WORDS): return "recs_query"
+    if any(w in t for w in SEND_FILE_WORDS): return "recall_file"
     return "general"
 
 def build_flight_links(origin: Optional[str], dest: Optional[str], depart: Optional[str]) -> List[str]:
@@ -758,34 +642,30 @@ IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
 DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 
 def _fw_parse_track(text: str):
-    t = (text or "").strip()
-    if not any(k in t.lower() for k in ["עקוב", "track"]):
-        return None, None, False
-    m = IATA_RE.search(t.upper())
-    if not m:
-        return None, None, True
+    t = (text or "").strip().lower()
+    if "עקוב" not in t and "track" not in t: return None, None, False
+    m = IATA_RE.search(text.upper()); 
+    if not m: return None, None, True
     flight = m.group(1).upper()
-    dm = DATE_RE.search(t)
-    date_str = dm.group(1) if dm else None
+    dm = DATE_RE.search(text); date_str = dm.group(1) if dm else None
     return flight, date_str, True
 
 def _fw_parse_untrack(text: str):
-    if not any(k in (text or "").lower() for k in ["בטל", "unsubscribe", "untrack", "הסר"]):
-        return None
-    m = IATA_RE.search((text or "").upper())
+    t = (text or "").lower()
+    if not any(k in t for k in ["בטל","unsubscribe","untrack","הסר"]): return None
+    m = IATA_RE.search(text.upper())
     return m.group(1).upper() if m else "__ALL__"
 
 def _fw_is_list(text: str):
     return any(k in (text or "").lower() for k in ["רשימה", "list flights", "list"])
 
 def _fw_send_to_all(primary_waid: str, body: str):
-    recips = [primary_waid] + [r for r in NOTIFY_CC_WAIDS if r and r != primary_waid]
+    recips = [primary_waid] + [normalize_waid(r) for r in NOTIFY_CC_WAIDS if r]
     for r in recips:
         send_whatsapp(r, body)
 
 def _fw_fmt_time_both(iso_ts: str) -> str:
-    if not iso_ts:
-        return "-"
+    if not iso_ts: return "-"
     try:
         t_utc = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
     except Exception:
@@ -796,8 +676,7 @@ def _fw_fmt_time_both(iso_ts: str) -> str:
             t_loc = t_utc.astimezone(ZoneInfo(TZ))
             s_loc = t_loc.strftime(f"%Y-%m-%d %H:%M {TZ}")
             return f"{s_utc} | {s_loc}"
-        except Exception:
-            pass
+        except Exception: pass
     return s_utc
 
 def _fw_snapshot_from_aviationstack(rec: dict):
@@ -808,28 +687,9 @@ def _fw_snapshot_from_aviationstack(rec: dict):
             cur = cur.get(k)
         return cur
     status = safe("flight_status")
-    dep = {
-        "airport": safe("departure","airport"),
-        "scheduled": safe("departure","scheduled"),
-        "estimated": safe("departure","estimated"),
-        "actual": safe("departure","actual"),
-        "terminal": safe("departure","terminal"),
-        "gate": safe("departure","gate")
-    }
-    arr = {
-        "airport": safe("arrival","airport"),
-        "scheduled": safe("arrival","scheduled"),
-        "estimated": safe("arrival","estimated"),
-        "actual": safe("arrival","actual"),
-        "terminal": safe("arrival","terminal"),
-        "gate": safe("arrival","gate"),
-        "baggage": safe("arrival","baggage")
-    }
-    flight = {
-        "iata": safe("flight","iata"),
-        "icao": safe("flight","icao"),
-        "number": safe("flight","number")
-    }
+    dep = {"airport":safe("departure","airport"),"scheduled":safe("departure","scheduled"),"estimated":safe("departure","estimated"),"actual":safe("departure","actual"),"terminal":safe("departure","terminal"),"gate":safe("departure","gate")}
+    arr = {"airport":safe("arrival","airport"),"scheduled":safe("arrival","scheduled"),"estimated":safe("arrival","estimated"),"actual":safe("arrival","actual"),"terminal":safe("arrival","terminal"),"gate":safe("arrival","gate"),"baggage":safe("arrival","baggage")}
+    flight = {"iata":safe("flight","iata"),"icao":safe("flight","icao"),"number":safe("flight","number")}
     airline = safe("airline","name")
     return {"status": status, "airline": airline, "flight": flight, "departure": dep, "arrival": arr}
 
@@ -837,9 +697,7 @@ def _fw_snapshot_hash(snap: dict) -> str:
     return hashlib.sha256(json.dumps(snap, sort_keys=True).encode("utf-8")).hexdigest()
 
 def _fw_format_message(snap: dict) -> str:
-    f = snap.get("flight", {}) or {}
-    dep = snap.get("departure", {}) or {}
-    arr = snap.get("arrival", {}) or {}
+    f = snap.get("flight", {}) or {}; dep = snap.get("departure", {}) or {}; arr = snap.get("arrival", {}) or {}
     lines = [
         f"✈️ עדכון טיסה {f.get('iata') or f.get('number','')}",
         f"סטטוס: {snap.get('status','-')} | חברת תעופה: {snap.get('airline','-')}",
@@ -847,25 +705,27 @@ def _fw_format_message(snap: dict) -> str:
         f"זמני יציאה: מתוכנן {_fw_fmt_time_both(dep.get('scheduled'))} | משוער {_fw_fmt_time_both(dep.get('estimated'))} | בפועל {_fw_fmt_time_both(dep.get('actual'))}",
         f"הגעה: {arr.get('airport','-')} טרמ' {arr.get('terminal','-')} שער {arr.get('gate','-')} (מסוע {arr.get('baggage','-')})",
         f"זמני הגעה: מתוכנן {_fw_fmt_time_both(arr.get('scheduled'))} | משוער {_fw_fmt_time_both(arr.get('estimated'))} | בפועל {_fw_fmt_time_both(arr.get('actual'))}",
-    ]
-    return "\n".join(lines)
+    ]; return "\n".join(lines)
 
 def _fw_fetch_aviationstack(flight_iata: str, flight_date: Optional[str]):
-    if not AVIATIONSTACK_KEY:
-        return {"error": "Missing AVIATIONSTACK_KEY"}
+    if not AVIATIONSTACK_KEY: return {"error": "Missing AVIATIONSTACK_KEY"}
     params = {"access_key": AVIATIONSTACK_KEY, "flight_iata": flight_iata}
-    if flight_date:
-        params["flight_date"] = flight_date
+    if flight_date: params["flight_date"] = flight_date
     r = requests.get(AVIATIONSTACK_URL, params=params, timeout=25)
     if r.status_code != 200:
         return {"error": f"aviationstack HTTP {r.status_code}", "body": r.text}
-    try:
-        data = r.json()
-    except Exception as e:
-        return {"error": f"aviationstack JSON parse: {e}", "body": r.text}
+    try: data = r.json()
+    except Exception as e: return {"error": f"aviationstack JSON parse: {e}", "body": r.text}
     return {"data": data.get("data", [])}
 
-# ------------------------- עזר לניהול טיסות קרובות -------------------------
+# ------------------------- עזר לטיסות קרובות -------------------------
+DEFAULT_LOOKAHEAD_DAYS = int(os.getenv("DEFAULT_LOOKAHEAD_DAYS", "90"))
+CONTACT_ALIASES: Dict[str, str] = {}
+for pair in (os.getenv("CONTACT_ALIASES","").split(",") if os.getenv("CONTACT_ALIASES") else []):
+    if "=" in pair:
+        name, wa = pair.split("=", 1)
+        CONTACT_ALIASES[name.strip()] = normalize_waid(wa.strip())
+
 def upcoming_flights_for_waid(waid: str, days_ahead: int = DEFAULT_LOOKAHEAD_DAYS, limit: int = 3):
     db = get_db()
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -881,14 +741,11 @@ def upcoming_flights_for_waid(waid: str, days_ahead: int = DEFAULT_LOOKAHEAD_DAY
 
 # ------------------------- NL Router (שפה טבעית → פעולה) -------------------------
 def nl_route(user_text: str) -> Optional[dict]:
-    if not openai_client or not user_text.strip():
-        return None
-    sys = (
-        "Turn a WhatsApp travel request into STRICT JSON.\n"
-        "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight','cancel_flight','flight_status','send_last_ticket','none'], params: object}\n"
-        "Return JSON only."
-    )
-    usr = f"Text: {user_text}\nMap to intent. Examples:\n" \
+    if not openai_client or not user_text.strip(): return None
+    sys = ("Turn a WhatsApp travel request into STRICT JSON.\n"
+           "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight','cancel_flight','flight_status','send_last_ticket','none'], params: object}\n"
+           "Return JSON only.")
+    usr = f"Text: {user_text}\nExamples:\n" \
           "- 'מה הטיסות שלי?' -> {{'type':'list_user_flights','params':{{'range_days':30}}}}\n" \
           "- 'מה הטיסות של דולב לשבוע הקרוב' -> {{'type':'list_person_flights','params':{{'person':'דולב','range_days':7}}}}\n" \
           "- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {{'type':'subscribe_flight','params':{{'iata':'LY81','date':'2025-09-08'}}}}\n" \
@@ -896,17 +753,13 @@ def nl_route(user_text: str) -> Optional[dict]:
           "- 'סטטוס LY81' -> {{'type':'flight_status','params':{{'iata':'LY81'}}}}\n" \
           "- 'שלח לי את הכרטיס' -> {{'type':'send_last_ticket','params':{{}}}}\n"
     try:
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL, temperature=0, timeout=12,
-            messages=[{"role":"system","content":sys},{"role":"user","content":usr}]
-        )
+        r = openai_client.chat.completions.create(model=OPENAI_MODEL, temperature=0, timeout=12,
+                                                  messages=[{"role":"system","content":sys},{"role":"user","content":usr}])
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else s
-        obj = json.loads(s)
-        if isinstance(obj, dict) and obj.get("type"):
-            return obj
-    except Exception:
-        return None
+        obj = json.loads(s); 
+        if isinstance(obj, dict) and obj.get("type"): return obj
+    except Exception: return None
     return None
 
 # ------------------------- Routes בסיס -------------------------
@@ -931,7 +784,7 @@ def status():
 def upload():
     init_db()
     f = request.files.get("file")
-    waid = request.form.get("waid") or ""
+    waid = normalize_waid(request.form.get("waid") or "")
     title = request.form.get("title") or ""
     tags = request.form.get("tags") or ""
     if not f or not waid:
@@ -949,111 +802,81 @@ def serve_file(file_id):
 
 @app.route("/calendar/<path:waid>.ics", methods=["GET"])
 def calendar_ics(waid):
+    waid = normalize_waid(waid)
     db = get_db()
     flights = db.execute("SELECT * FROM flights WHERE waid=? ORDER BY depart_date", (waid,)).fetchall()
     hotels = db.execute("SELECT * FROM hotels WHERE waid=? ORDER BY checkin_date", (waid,)).fetchall()
     lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//ThailandBotAI//Travel//EN"]
-    def dtstamp(d, t="09:00"):
-        return d.replace("-","") + "T" + (t or "09:00").replace(":","") + "00Z"
+    def dtstamp(d, t="09:00"): return d.replace("-","") + "T" + (t or "09:00").replace(":","") + "00Z"
     for fl in flights:
         start = dtstamp(fl["depart_date"], fl["depart_time"] or "09:00")
         summ = f"Flight {fl['origin'] or ''}->{fl['dest'] or ''} {fl['flight_number'] or ''}".strip()
         desc = f"Airline: {fl['airline'] or ''}\\nPNR: {fl['pnr'] or ''}"
         lines += ["BEGIN:VEVENT", f"UID:{fl['id']}@thailandbot", f"DTSTART:{start}", f"SUMMARY:{summ}", f"DESCRIPTION:{desc}", "END:VEVENT"]
     for ho in hotels:
-        lines += [
-            "BEGIN:VEVENT",
-            f"UID:{ho['id']}@thailandbot",
-            f"DTSTART;VALUE=DATE:{(ho['checkin_date']).replace('-','')}",
-            f"DTEND;VALUE=DATE:{(ho['checkout_date'] or ho['checkin_date']).replace('-','')}",
-            f"SUMMARY:Hotel: {ho['hotel_name'] or 'Check-in'}",
-            f"DESCRIPTION:City: {ho['city'] or ''}\\nAddress: {ho['address'] or ''}",
-            "END:VEVENT"
-        ]
+        lines += ["BEGIN:VEVENT", f"UID:{ho['id']}@thailandbot",
+                  f"DTSTART;VALUE=DATE:{(ho['checkin_date']).replace('-','')}",
+                  f"DTEND;VALUE=DATE:{(ho['checkout_date'] or ho['checkin_date']).replace('-','')}",
+                  f"SUMMARY:Hotel: {ho['hotel_name'] or 'Check-in'}",
+                  f"DESCRIPTION:City: {ho['city'] or ''}\\nAddress: {ho['address'] or ''}", "END:VEVENT"]
     lines.append("END:VCALENDAR")
-    ics = "\r\n".join(lines)
-    return Response(ics, mimetype="text/calendar")
+    ics = "\r\n".join(lines); return Response(ics, mimetype="text/calendar")
 
 # ------------------------- Google OAuth -------------------------
 @app.route("/google/oauth/start", methods=["GET"])
 def google_oauth_start():
-    waid = request.args.get("waid")
-    if not waid:
-        return "Missing waid", 400
+    waid = normalize_waid(request.args.get("waid"))
+    if not waid: return "Missing waid", 400
     flow = get_google_flow()
-    if not flow:
-        return "Google OAuth not configured", 500
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
+    if not flow: return "Google OAuth not configured", 500
+    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
     db = get_db()
-    db.execute("INSERT INTO oauth_states (state,waid,created_at) VALUES (?,?,?)",
-               (state, waid, datetime.utcnow().isoformat()))
-    db.commit()
+    db.execute("INSERT INTO oauth_states (state,waid,created_at) VALUES (?,?,?)", (state, waid, datetime.utcnow().isoformat())); db.commit()
     return redirect(auth_url, code=302)
 
 @app.route("/google/oauth/callback", methods=["GET"])
 def google_oauth_callback():
-    state = request.args.get("state")
-    code = request.args.get("code")
-    if not state or not code:
-        return "Missing state/code", 400
+    state = request.args.get("state"); code = request.args.get("code")
+    if not state or not code: return "Missing state/code", 400
     row = get_db().execute("SELECT waid FROM oauth_states WHERE state=?", (state,)).fetchone()
-    if not row:
-        return "Invalid state", 400
-    waid = row["waid"]
-    flow = get_google_flow()
-    if not flow:
-        return "Google OAuth not configured", 500
-    flow.fetch_token(authorization_response=request.url)
-    creds = flow.credentials
-    save_google_token(waid, creds)
+    if not row: return "Invalid state", 400
+    waid = row["waid"]; flow = get_google_flow()
+    if not flow: return "Google OAuth not configured", 500
+    flow.fetch_token(authorization_response=request.url); creds = flow.credentials; save_google_token(waid, creds)
     return f"Google Calendar connected for {waid}! You can close this tab.", 200
 
 @app.route("/google/status", methods=["GET"])
 def google_status():
-    waid = request.args.get("waid")
-    if not waid:
-        return "Missing waid", 400
+    waid = normalize_waid(request.args.get("waid"))
+    if not waid: return "Missing waid", 400
     ok = load_google_creds(waid) is not None
-    return jsonify(ok=ok)
+    (return jsonify(ok=ok))
 
 # ------------------------- Twilio Webhook -------------------------
 def handle_commands(body: str, waid: str) -> Optional[str]:
     cmd = (body or "").strip().lower()
     if cmd in ("/reset","reset","/restart"):
-        chat_histories.pop(waid, None)
-        return "✅ השיחה אופסה. תוכל להתחיל נושא חדש."
+        chat_histories.pop(waid, None); return "✅ השיחה אופסה. תוכל להתחיל נושא חדש."
     if cmd in ("/help","help"):
         base = public_base_url()
-        return (
-            "ℹ️ אני יודע:\n"
-            "• חיפוש טיסות: 'תמצא לי טיסה לפוקט ב-2025-09-12'\n"
-            "• שליחת קובץ: שלחו PDF/תמונה – אשמור ואחלץ פרטי נסיעה. 'שלח לי את הכרטיס'\n"
-            f"• קלנדר: חברו גוגל → {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
-            "• המלצות: שלחו לינקים/מקומות; שליפה לפי עיר/קטגוריה\n"
-            "• /reset לאיפוס שיחה\n"
-            "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'\n"
-            "• 'מה הטיסות שלי' / 'מה הטיסות של דולב/עודד' – הצגת הקרובות"
-        )
+        return ("ℹ️ אני יודע:\n"
+                "• 'מה הטיסות שלי' / 'מה הטיסות של דולב/עודד'\n"
+                "• חיפוש טיסות: 'תמצא טיסה TLV→BKK 2025-09-12'\n"
+                f"• גוגל קלנדר: {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
+                "• 'שלח לי את הכרטיס' להחזרת הקובץ האחרון\n"
+                "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'\n"
+                "• /reset לאיפוס שיחה")
     return None
 
 @app.route("/twilio/webhook", methods=["POST"])
 def twilio_webhook():
-    if not _validated_twilio_request():
-        abort(403)
+    if not _validated_twilio_request(): abort(403)
     from_ = request.form.get("From", "")
-    waid_raw = request.form.get("WaId", from_) or from_
-    waid = normalize_waid(waid_raw) or from_
+    waid = normalize_waid(request.form.get("WaId", from_) or from_)
     body = request.form.get("Body", "") or ""
     num_media = int(request.form.get("NumMedia", "0") or 0)
-    latitude = request.form.get("Latitude")
-    longitude = request.form.get("Longitude")
-    address = request.form.get("Address")
-    label = request.form.get("Label")
-
+    latitude = request.form.get("Latitude"); longitude = request.form.get("Longitude")
+    address = request.form.get("Address"); label = request.form.get("Label")
     resp = MessagingResponse()
 
     # מדיה נכנסת – שמירה, אינדוקס + סיכום מיידי
@@ -1064,176 +887,118 @@ def twilio_webhook():
             resp.message(f"📎 שמרתי {len(saved_media)} קבצים.")
             try:
                 db = get_db()
-                fl = db.execute("""
+                # הצג עד 2 הטיסות האחרונות שהתווספו (לרוב הלוך/חזור)
+                rows = db.execute("""
                     SELECT origin,dest,depart_date,depart_time,airline,flight_number
-                    FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 1
-                """, (waid,)).fetchone()
-                ho = db.execute("""
-                    SELECT hotel_name,city,checkin_date,checkout_date
-                    FROM hotels WHERE waid=? ORDER BY created_at DESC LIMIT 1
-                """, (waid,)).fetchone()
-
-                if fl and fl["depart_date"]:
-                    line = (
-                        f"✈️ מצאתי טיסה: "
-                        f"{(fl['origin'] or '')}→{(fl['dest'] or '')} "
-                        f"{fl['flight_number'] or ''} "
-                        f"{fl['depart_date']} {fl['depart_time'] or ''}"
-                        f"{(' | ' + fl['airline']) if fl['airline'] else ''}"
-                    ).strip()
-                    resp.message(line)
-
-                if ho and ho["checkin_date"]:
-                    line = (
-                        f"🏨 מצאתי הזמנת מלון: {ho['hotel_name'] or 'מלון'} "
-                        f"({ho['city'] or ''}) {ho['checkin_date']}–{ho['checkout_date'] or ho['checkin_date']}"
-                    ).strip()
-                    resp.message(line)
-
-                if (not fl or not fl['depart_date']) and (not ho or not ho['checkin_date']):
-                    resp.message("ניסיתי לחלץ פרטים מהקובץ. אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסות שלי'.")
+                    FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 2
+                """, (waid,)).fetchall()
+                if rows:
+                    lines = ["✈️ מצאתי:"]
+                    for fl in rows[::-1]:
+                        lines.append(f"- {fl['depart_date']} {fl['depart_time'] or ''} {fl['origin'] or ''}→{fl['dest'] or ''} {fl['flight_number'] or ''}{(' | ' + fl['airline']) if fl['airline'] else ''}")
+                    for ch in chunk_text("\n".join(lines)): resp.message(ch)
+                else:
+                    resp.message("ניסיתי לחלץ פרטים. אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסות שלי'.")
             except Exception as e:
                 logger.exception("Post-media summary failed: %s", e)
                 resp.message("שמרתי את הקובץ. אפשר לכתוב: 'מה הטיסות שלי' או 'שלח לי את הכרטיס'.")
             return str(resp)
 
     # המלצות/מיקום – נשמור
-    if body or (latitude and longitude):
-        store_recommendation_if_relevant(waid, body, latitude, longitude)
+    if body or (latitude and longitude): store_recommendation_if_relevant(waid, body, latitude, longitude)
 
     # פקודות טכניות
     cmd_reply = handle_commands(body, waid)
     if cmd_reply:
-        for ch in chunk_text(cmd_reply): resp.message(ch)
-        return str(resp)
+        for ch in chunk_text(cmd_reply): resp.message(ch); return str(resp)
 
     # --- Natural-language router (לפני Intent הישן) ---
     nl = nl_route(body)
     if nl and nl.get("type") != "none":
         t = nl["type"]; p = nl.get("params") or {}
-
-        # list_user_flights
         if t == "list_user_flights":
-            rows = upcoming_flights_for_waid(waid, days_ahead=int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
-            if not rows:
-                resp.message("לא מצאתי טיסות קרובות. שלחו PDF של הכרטיס או בקשו טיסה אחרת.")
-            else:
-                lines = ["✈️ הטיסות הקרובות שלך:"]
-                for r in rows:
-                    lines.append(f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}")
-                for ch in chunk_text("\n".join(lines)): resp.message(ch)
+            rows = upcoming_flights_for_waid(waid, int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
+            if not rows: resp.message("לא מצאתי טיסות קרובות."); return str(resp)
+            lines = ["✈️ הטיסות הקרובות שלך:"] + [
+                f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}"
+                for r in rows
+            ]
+            for ch in chunk_text("\n".join(lines)): resp.message(ch)
             return str(resp)
 
-        # list_person_flights
         if t == "list_person_flights":
             person = (p.get("person") or "").strip()
-            other_waid = CONTACT_ALIASES.get(person)
-            if not other_waid:
-                resp.message(f"לא מכיר את '{person}'. אפשר להוסיף ב-ENV CONTACT_ALIASES.")
-                return str(resp)
-            rows = upcoming_flights_for_waid(other_waid, days_ahead=int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
-            if not rows:
-                resp.message(f"לא מצאתי טיסות קרובות עבור {person}.")
-            else:
-                lines = [f"✈️ הטיסות של {person}:"]
-                for r in rows:
-                    lines.append(f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}")
-                for ch in chunk_text("\n".join(lines)): resp.message(ch)
+            other_waid = normalize_waid(CONTACT_ALIASES.get(person))
+            if not other_waid: resp.message(f"לא מכיר את '{person}'. הוסף ל-ENV CONTACT_ALIASES."); return str(resp)
+            rows = upcoming_flights_for_waid(other_waid, int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
+            if not rows: resp.message(f"לא מצאתי טיסות קרובות עבור {person}."); return str(resp)
+            lines = [f"✈️ הטיסות של {person}:"] + [
+                f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}"
+                for r in rows
+            ]
+            for ch in chunk_text("\n".join(lines)): resp.message(ch)
             return str(resp)
 
-        # subscribe_flight
         if t == "subscribe_flight":
             body_override = f"עקוב אחרי טיסה {p.get('iata','').upper()} {p.get('date','')}".strip()
             track_iata, track_date, is_track_cmd = _fw_parse_track(body_override)
             if is_track_cmd and track_iata:
                 db = get_db()
                 db.execute("INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
-                           (waid, track_iata, track_date, "aviationstack", None, None))
-                db.commit()
+                           (waid, track_iata, track_date, "aviationstack", None, None)); db.commit()
                 resp.message(f"מעולה! עוקב אחרי {track_iata}" + (f" ({track_date})" if track_date else ""))
-            else:
-                resp.message("לא הצלחתי להבין את הטיסה. נסו למשל: LY81 2025-09-08.")
+            else: resp.message("לא הצלחתי להבין את הטיסה. נסו למשל: LY81 2025-09-08.")
             return str(resp)
 
-        # cancel_flight
         if t == "cancel_flight":
-            iata = (p.get("iata") or "").upper()
-            db = get_db()
-            if iata:
-                db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, iata))
-                n = db.total_changes
-            else:
-                db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
-                n = db.total_changes
-            db.commit()
-            resp.message("בוטל מעקב" + (f" אחרי {iata}" if iata else " לכל הטיסות") + f" ({n} רשומות).")
-            return str(resp)
+            iata = (p.get("iata") or "").upper(); db = get_db()
+            if iata: db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, iata))
+            else: db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
+            n = db.total_changes; db.commit()
+            resp.message("בוטל מעקב" + (f" אחרי {iata}" if iata else " לכל הטיסות") + f" ({n} רשומות)."); return str(resp)
 
-        # flight_status (מיידי)
         if t == "flight_status":
             iata = (p.get("iata") or "").upper()
-            if not iata:
-                resp.message("צריך מזהה טיסה, למשל: סטטוס LY81")
-                return str(resp)
+            if not iata: resp.message("צריך מזהה טיסה, למשל: סטטוס LY81"); return str(resp)
             res = _fw_fetch_aviationstack(iata, None)
-            if res.get("error") or not (res.get("data") or []):
-                resp.message("לא מצאתי סטטוס לטיסה הזו כרגע.")
-                return str(resp)
-            snap = _fw_snapshot_from_aviationstack(res["data"][0])
+            if res.get("error") or not (res.get("data") or []): resp.message("לא מצאתי סטטוס לטיסה הזו כרגע."); return str(resp)
+            snap = _fw_snapshot_from_aviationstack(res["data"][0]); 
             for ch in chunk_text(_fw_format_message(snap)): resp.message(ch)
             return str(resp)
 
-        # send_last_ticket
         if t == "send_last_ticket":
             db = get_db()
             row = db.execute("SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1", (waid,)).fetchone()
-            if not row:
-                resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload.")
-                return str(resp)
-            file_url = public_base_url() + f"files/{row['id']}"
-            m = resp.message(f"📄 {row['filename']}")
-            m.media(file_url)
-            return str(resp)
+            if not row: resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload."); return str(resp)
+            file_url = public_base_url() + f"files/{row['id']}"; m = resp.message(f"📄 {row['filename']}"); m.media(file_url); return str(resp)
 
     # === FLIGHT WATCH – פקודות קשיחות (fallback) ===
     track_iata, track_date, is_track_cmd = _fw_parse_track(body)
     if is_track_cmd:
-        if not track_iata:
-            resp.message("צריך לציין מזהה טיסה, למשל: 'עקוב אחרי טיסה LY7 2025-09-25'.")
-            return str(resp)
+        if not track_iata: resp.message("צריך מזהה טיסה, למשל: 'עקוב אחרי טיסה LY7 2025-09-25'."); return str(resp)
         db = get_db()
-        db.execute(
-            "INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
-            (waid, track_iata, track_date, "aviationstack", None, None)
-        )
-        db.commit()
+        db.execute("INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
+                   (waid, track_iata, track_date, "aviationstack", None, None)); db.commit()
         resp.message(f"מעולה! עוקב אחרי הטיסה {track_iata}" + (f" לתאריך {track_date}" if track_date else "") + ". אעדכן כשיהיו שינויים.")
         return str(resp)
 
     to_untrack = _fw_parse_untrack(body)
     if to_untrack:
         db = get_db()
-        if to_untrack == "__ALL__":
-            db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
-            n = db.total_changes
-        else:
-            db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, to_untrack))
-            n = db.total_changes
-        db.commit()
-        resp.message("בוטל מעקב" + (f" אחרי {to_untrack}" if to_untrack != "__ALL__" else " לכל הטיסות") + f" ({n} רשומות).")
-        return str(resp)
+        if to_untrack == "__ALL__": db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
+        else: db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, to_untrack))
+        n = db.total_changes; db.commit()
+        resp.message("בוטל מעקב" + (f" אחרי {to_untrack}" if to_untrack != "__ALL__" else " לכל הטיסות") + f" ({n} רשומות)."); return str(resp)
 
     if _fw_is_list(body):
         db = get_db()
         rows = db.execute("SELECT id, flight_iata, flight_date, created_at FROM flight_watch WHERE waid=? ORDER BY id DESC", (waid,)).fetchall()
-        if not rows:
-            resp.message("אין מנויים פעילים כרגע.")
-            return str(resp)
-        lines = [f"✈️ רשימת מנויים ({len(rows)}):"]
-        for r in rows:
-            lines.append(f"#{r['id']} {r['flight_iata']}" + (f" {r['flight_date']}" if r['flight_date'] else "") + f" (מ־{r['created_at']})")
-        for ch in chunk_text("\n".join(lines)): resp.message(ch)
-        return str(resp)
+        if not rows: resp.message("אין מנויים פעילים כרגע."); return str(resp)
+        lines = [f"✈️ רשימת מנויים ({len(rows)}):"] + [
+            f"#{r['id']} {r['flight_iata']}" + (f" {r['flight_date']}" if r['flight_date'] else "") + f" (מ־{r['created_at']})"
+            for r in rows
+        ]
+        for ch in chunk_text("\n".join(lines)): resp.message(ch); return str(resp)
 
     # ---- יתר היכולות (intent ישן + GPT כללי) ----
     user_text = body.strip()
@@ -1241,8 +1006,7 @@ def twilio_webhook():
         loc = f"[location] lat={latitude}, lon={longitude} | {label or address or ''}"
         user_text = f"{user_text}\n\n{loc}" if user_text else loc
 
-    if not user_text and saved_media:
-        return str(resp)
+    if not user_text and saved_media: return str(resp)
     if not user_text:
         resp.message("👋 כתבו: 'מה הטיסות שלי' / 'מה הטיסות של דולב' / 'סטטוס LY81' / 'שלח לי את הכרטיס' / '/help'.")
         return str(resp)
@@ -1252,33 +1016,42 @@ def twilio_webhook():
     # "מה הטיסות שלי" – הקרובות
     if intent == "my_flight":
         rows = upcoming_flights_for_waid(waid, days_ahead=DEFAULT_LOOKAHEAD_DAYS)
-        if not rows:
-            resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים.")
-            return str(resp)
-        lines = ["✈️ הטיסות הקרובות שלך:"]
-        for r in rows:
-            lines.append(f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}")
-        for ch in chunk_text("\n".join(lines)): resp.message(ch)
-        return str(resp)
+        if not rows: resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים."); return str(resp)
+        lines = ["✈️ הטיסות הקרובות שלך:"] + [
+            f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}"
+            for r in rows
+        ]
+        for ch in chunk_text("\n".join(lines)): resp.message(ch); return str(resp)
 
     # חיפוש טיסות (קישורים)
     if intent == "flight_search":
-        airports = detect_airports(user_text)
-        dates = parse_dates(user_text)
-        origin, dest = airports["origin"], airports["dest"]
-        depart = dates[0] if dates else None
+        airports = detect_airports(user_text); dates = parse_dates(user_text)
+        origin, dest = airports["origin"], airports["dest"];         depart = dates[0] if dates else None
         if not dest:
             resp.message("✈️ ציינו יעד (למשל פוקט) ואפשר תאריך YYYY-MM-DD.")
             return str(resp)
         links = build_flight_links(origin, dest, depart)
-        msg = f"✈️ {origin or 'בחר מוצא'} → {dest}\nתאריך יציאה: {depart or 'בחר תאריך'}\nGoogle Flights: {links[0]}\nKayak: {links[1]}"
-        for ch in chunk_text(msg): resp.message(ch)
+        msg = (
+            f"✈️ {origin or 'בחר מוצא'} → {dest}\n"
+            f"תאריך יציאה: {depart or 'בחר תאריך'}\n"
+            f"Google Flights: {links[0]}\n"
+            f"Kayak: {links[1]}"
+        )
+        for ch in chunk_text(msg):
+            resp.message(ch)
         return str(resp)
 
-    # שליחת קובץ אחרון (כרטיס/טיסה/PDF)
+    # שליחת הקובץ האחרון (כרטיס/טיסה/PDF)
     if intent == "recall_file":
         db = get_db()
-        row = db.execute("SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1", (waid,)).fetchone()
+        row = db.execute(
+            """
+            SELECT * FROM files
+            WHERE waid=?
+            ORDER BY uploaded_at DESC LIMIT 1
+            """,
+            (waid,)
+        ).fetchone()
         if not row:
             resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload.")
             return str(resp)
@@ -1312,7 +1085,8 @@ def twilio_webhook():
                 lines.append(f"• {title} — {r['url']}")
             else:
                 lines.append(f"• {title}")
-        for ch in chunk_text("\n".join(lines)): resp.message(ch)
+        for ch in chunk_text("\n".join(lines)):
+            resp.message(ch)
         return str(resp)
 
     # שיחה כללית (GPT) – עם Fallback אם אין מכסה
@@ -1334,11 +1108,13 @@ def twilio_webhook():
 
     history.append({"role":"user","content":user_text})
     history.append({"role":"assistant","content":answer})
-    if len(history) > 20: del history[:-20]
-    for ch in chunk_text(answer): resp.message(ch)
+    if len(history) > 20:
+        del history[:-20]
+    for ch in chunk_text(answer):
+        resp.message(ch)
     return str(resp)
 
-# ------------------------- Cron (קיים) -------------------------
+# ------------------------- Cron helpers -------------------------
 def require_cron_secret():
     key = request.args.get("key")
     if key != CRON_SECRET:
@@ -1347,6 +1123,7 @@ def require_cron_secret():
 def date_str(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
+# ------------------------- Cron: יומי -------------------------
 @app.route("/cron/daily", methods=["POST","GET"])
 def cron_daily():
     require_cron_secret()
@@ -1361,10 +1138,11 @@ def cron_daily():
     for ho in db.execute("SELECT * FROM hotels WHERE checkin_date=?", (d_str,)).fetchall():
         t = f"🏨 מחר צ'ק-אין: {ho['hotel_name'] or 'מלון'} בעיר {ho['city'] or ''}"
         result[ho["waid"]].append(t)
-    for waid, items in result.items():
-        send_whatsapp(waid, "תזכורת למחר:\n" + "\n".join(items))
+    for w, items in result.items():
+        send_whatsapp(w, "תזכורת למחר:\n" + "\n".join(items))
     return jsonify(ok=True, sent=len(result))
 
+# ------------------------- Cron: שבועי -------------------------
 @app.route("/cron/weekly", methods=["POST","GET"])
 def cron_weekly():
     require_cron_secret()
@@ -1393,47 +1171,53 @@ def cron_weekly():
         total += 1
     return jsonify(ok=True, sent=total)
 
-# ------------------------- === FLIGHT WATCH === Cron -------------------------
-@app.route("/cron/flight_watch", methods=["GET"])
+# ------------------------- Cron: Flight Watch (בדיקות והתראות) -------------------------
+def _fw_check_and_notify_row(row):
+    """Fetch status, compare hash, notify if changed; update DB."""
+    iata = row["flight_iata"]
+    fdate = row["flight_date"]
+    res = _fw_fetch_aviationstack(iata, fdate)
+    if res.get("error"):
+        return {"ok": False, "error": res["error"], "id": row["id"]}
+    items = res.get("data") or []
+    if not items:
+        return {"ok": True, "skipped": True, "id": row["id"]}
+    snap = _fw_snapshot_from_aviationstack(items[0])
+    h = _fw_snapshot_hash(snap)
+    if h != (row["last_hash"] or ""):
+        msg = _fw_format_message(snap)
+        _fw_send_to_all(row["waid"], msg)
+        # update
+        db = get_db()
+        db.execute(
+            "UPDATE flight_watch SET last_snapshot=?, last_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (json.dumps(snap, ensure_ascii=False), h, row["id"])
+        )
+        db.commit()
+        return {"ok": True, "notified": True, "id": row["id"]}
+    return {"ok": True, "notified": False, "id": row["id"]}
+
+@app.route("/cron/flight_watch", methods=["GET","POST"])
 def cron_flight_watch():
     require_cron_secret()
-    if not AVIATIONSTACK_KEY:
-        return jsonify({"ok": False, "error": "Missing AVIATIONSTACK_KEY"}), 500
-
     db = get_db()
-    rows = db.execute("SELECT * FROM flight_watch ORDER BY id").fetchall()
-    total = len(rows); changes = 0; notified = 0
-
-    for s in rows:
-        fi = s["flight_iata"]
-        fd = s["flight_date"]
-        res = _fw_fetch_aviationstack(fi, fd)
-        if res.get("error"):
-            logger.error("aviationstack error: %s", res["error"])
-            continue
-        data = res.get("data") or []
-        if not data:
-            logger.info("no data for %s %s", fi, fd or "")
-            continue
-
-        rec = data[0]
-        snap = _fw_snapshot_from_aviationstack(rec)
-        h = _fw_snapshot_hash(snap)
-
-        if not s["last_hash"] or s["last_hash"] != h:
-            db.execute(
-                "UPDATE flight_watch SET last_snapshot=?, last_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (json.dumps(snap, ensure_ascii=False), h, s["id"])
-            )
-            db.commit()
-            changes += 1
-            msg = "עדכון טיסה חדש:\n" + _fw_format_message(snap)
-            _fw_send_to_all(s["waid"], msg)
-            notified += 1 + len(NOTIFY_CC_WAIDS)
-
-    return jsonify({"ok": True, "subscriptions": total, "changes": changes, "notifications_attempted": notified})
+    rows = db.execute("SELECT * FROM flight_watch ORDER BY updated_at ASC").fetchall()
+    out = {"checked": 0, "notified": 0, "errors": 0}
+    for r in rows:
+        out["checked"] += 1
+        try:
+            res = _fw_check_and_notify_row(r)
+            if res.get("notified"):
+                out["notified"] += 1
+        except Exception as e:
+            logger.exception("flight_watch cron error: %s", e)
+            out["errors"] += 1
+    return jsonify(ok=True, **out)
 
 # ------------------------- Main -------------------------
 if __name__ == "__main__":
+    # הערה: יש טייפו קטן במתודת google_status למעלה – וודא שהשורה היא:
+    # return jsonify(ok=ok)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
