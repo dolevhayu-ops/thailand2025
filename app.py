@@ -848,9 +848,11 @@ def google_oauth_callback():
 @app.route("/google/status", methods=["GET"])
 def google_status():
     waid = normalize_waid(request.args.get("waid"))
-    if not waid: return "Missing waid", 400
+    if not waid:
+        return "Missing waid", 400
     ok = load_google_creds(waid) is not None
-    (return jsonify(ok=ok))
+    return jsonify(ok=ok)
+
 
 # ------------------------- Twilio Webhook -------------------------
 def handle_commands(body: str, waid: str) -> Optional[str]:
