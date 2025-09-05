@@ -603,7 +603,11 @@ def detect_intent(text: str) -> str:
     if "ics" in t and "calendar" in t: return "calendar_link"
     if any(w in t for w in RECO_WORDS): return "recs_query"
     if any(w in t for w in SEND_FILE_WORDS): return "recall_file"
+    # ✨ חדש: אם יש גם "פרטים" וגם "טיסה" → flight_details
+    if "פרטים" in t and "טיסה" in t:
+        return "flight_details"
     return "general"
+
 
 def build_flight_links(origin: Optional[str], dest: Optional[str], depart: Optional[str]) -> List[str]:
     if origin and dest and depart:
@@ -764,6 +768,8 @@ Examples:
 - 'שלח לי את הכרטיס' -> {{"type":"send_last_ticket","params":{}}}
 - 'תן לי פרטים על הטיסה' -> {{"type":"flight_details","params":{"scope":"latest"}}}
 - 'מה הפרטים של הטיסה חזור' -> {{"type":"flight_details","params":{"scope":"return"}}}
+- 'תן לי פרטים על הטיסה' -> {"type":"flight_details","params":{"scope":"latest"}}
+- 'פרטים על הטיסה חזור' -> {"type":"flight_details","params":{"scope":"return"}}
 - 'מה ה-PNR שלי?' -> {{"type":"flight_details","params":{"scope":"latest"}}}
 """
     try:
