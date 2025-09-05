@@ -750,38 +750,49 @@ def format_flight_details(rows):
 
 # ------------------------- NL Router (שפה טבעית → פעולה) -------------------------
 def nl_route(user_text: str) -> Optional[dict]:
-    if not openai_client or not user_text.strip(): return None
+    if not openai_client or not user_text.strip():
+        return None
+
     sys = (
         "Turn a WhatsApp travel request into STRICT JSON.\n"
-        "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight','cancel_flight','flight_status','send_last_ticket','flight_details','none'], params: object}\n"
+        "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight',"
+        "'cancel_flight','flight_status','send_last_ticket','flight_details','none'], params: object}\n"
         "Return JSON only."
     )
-    usr = f"""Text: {user_text}
+
+    usr = """Text: {}
 Examples:
-- 'מה הטיסות שלי?' -> {{"type":"list_user_flights","params":{"range_days":30}}}
-- 'מה הטיסות של דולב לשבוע הקרוב' -> {{"type":"list_person_flights","params":{"person":"דולב","range_days":7}}}
-- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {{"type":"subscribe_flight","params":{"iata":"LY81","date":"2025-09-08"}}}
-- 'בטל LY81' -> {{"type":"cancel_flight","params":{"iata":"LY81"}}}
-- 'סטטוס LY81' -> {{"type":"flight_status","params":{"iata":"LY81"}}}
-- 'שלח לי את הכרטיס' -> {{"type":"send_last_ticket","params":{}}}
-- 'תן לי פרטים על הטיסה' -> {{"type":"flight_details","params":{"scope":"latest"}}}
-- 'מה הפרטים של הטיסה חזור' -> {{"type":"flight_details","params":{"scope":"return"}}}
+- 'מה הטיסות שלי?' -> {"type":"list_user_flights","params":{"range_days":30}}
+- 'מה הטיסות של דולב לשבוע הקרוב' -> {"type":"list_person_flights","params":{"person":"דולב","range_days":7}}
+- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {"type":"subscribe_flight","params":{"iata":"LY81","date":"2025-09-08"}}
+- 'בטל LY81' -> {"type":"cancel_flight","params":{"iata":"LY81"}}
+- 'סטטוס LY81' -> {"type":"flight_status","params":{"iata":"LY81"}}
+- 'שלח לי את הכרטיס' -> {"type":"send_last_ticket","params":{}}
 - 'תן לי פרטים על הטיסה' -> {"type":"flight_details","params":{"scope":"latest"}}
+- 'מה הפרטים של הטיסה חזור' -> {"type":"flight_details","params":{"scope":"return"}}
 - 'פרטים על הטיסה חזור' -> {"type":"flight_details","params":{"scope":"return"}}
-- 'מה ה-PNR שלי?' -> {{"type":"flight_details","params":{"scope":"latest"}}}
-"""
+- 'מה ה-PNR שלי?' -> {"type":"flight_details","params":{"scope":"latest"}}
+""".format(user_text)
+
     try:
         r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL, temperature=0, timeout=12,
-            messages=[{"role":"system","content":sys},{"role":"user","content":usr}]
+            model=OPENAI_MODEL,
+            temperature=0,
+            timeout=12,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr},
+            ],
         )
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else s
         obj = json.loads(s)
         if isinstance(obj, dict) and obj.get("type"):
             return obj
-    except Exception:
+    except Exception as e:
+        logger.warning("nl_route failed: %s", e)
         return None
+
     return None
 
 # ------------------------- Routes בסיס -------------------------
