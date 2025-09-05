@@ -1,28 +1,26 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Google Calendar OAuth + Vision
+WhatsApp Travel Assistant – Free Chat Mode (Flask + Twilio + OpenAI + SQLite + ICS + Cron + Google OAuth + Vision)
 
-יכולות:
-- שיחה חופשית (GPT כשזמין; אחרת Fallback)
-- קבלת מדיה בוואטסאפ, שמירה וניתוח (PDF/תמונה) → Flights/Hotels + סיכום אוטומטי
-- שליחה חוזרת של קבצים ("שלח לי את הכרטיס")
-- חיפוש טיסות (לינקים)
-- פיד ICS אישי: /calendar/<WaId>.ics
-- Cron יומי/שבועי לוואטסאפ (תזכורות ודוח)
-- Google Calendar OAuth: הוספת אירועים אוטומטית ליומן
-- Vision לתמונות: חילוץ פרטי טיסה/מלון מתמונה
-- === FLIGHT WATCH === מעקב טיסות חינמי: פקודות (“עקוב אחרי טיסה …”, “בטל …”, “רשימה”), Cron והתראות
-- === NL ROUTER === הבנת שפה טבעית: “מה הטיסות של דולב/עודד?”, “מה הטיסות שלי?”, “סטטוס LY81”, “בטל LY81” וכו'
+תכונות:
+- 🧠 Free Chat Mode: טקסט חופשי → NL Router (GPT) → פעולה (ללא פקודות קשיחות)
+- 📎 קבלת מדיה (PDF/תמונה), שמירה ואינדוקס → חילוץ טיסות/מלונות (כולל ריבוי טיסות) + סיכום מיידי
+- 📄 שליחה חוזרת של הקובץ האחרון ("שלח לי את הכרטיס" בשפה חופשית)
+- ✈️ שאילתות על טיסות שלי/של דולב/עודד, סטטוס טיסה, רישום מעקב, ביטול מעקב, רשימת מעקבים
+- 📅 פיד ICS אישי: /calendar/<WaId>.ics
+- ⏰ Cron יומי/שבועי + Flight Watch (מעקב ושילוח התראות)
+- 📆 Google Calendar OAuth: הוספת אירועים ליומן
+- 👁️ Vision: חילוץ פרטי הזמנה מתמונה
 
 ENV (Render → Environment):
 OPENAI_API_KEY
-OPENAI_MODEL                (default: gpt-4o-mini)
-SYSTEM_PROMPT               (optional)
-VERIFY_TWILIO_SIGNATURE     ('false' default)
+OPENAI_MODEL                  (default: gpt-4o-mini)
+SYSTEM_PROMPT                 (optional)
+VERIFY_TWILIO_SIGNATURE       ('false' default)
 TWILIO_AUTH_TOKEN
 TWILIO_ACCOUNT_SID
-TWILIO_WHATSAPP_FROM        (או TWILIO_MESSAGING_SERVICE_SID)
+TWILIO_WHATSAPP_FROM          (או TWILIO_MESSAGING_SERVICE_SID)
 BASE_PUBLIC_URL
 CRON_SECRET
 TZ
@@ -32,19 +30,19 @@ GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 GOOGLE_OAUTH_REDIRECT_URI
 
-# === FLIGHT WATCH ===
+# Flight Watch
 AVIATIONSTACK_KEY
-NOTIFY_CC_WAIDS             (comma-separated whatsapp:+9725...,whatsapp:+9725...)
+NOTIFY_CC_WAIDS               (comma-separated whatsapp:+9725...,whatsapp:+9725...)
 
-# === NL ROUTER / ALIASES ===
-CONTACT_ALIASES             (e.g. "דולב=whatsapp:+972546867184,עודד=whatsapp:+972526244636")
-DEFAULT_LOOKAHEAD_DAYS      (default 90)
+# Aliases
+CONTACT_ALIASES               (e.g. "דולב=whatsapp:+972546867184,עודד=whatsapp:+972526244636")
+DEFAULT_LOOKAHEAD_DAYS        (default 90)
 
-Start command (Render):
+Start (Render):
 gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
 """
 
-import os, re, uuid, sqlite3, logging, json, mimetypes, hashlib
+import os, re, uuid, sqlite3, logging, json, mimetypes, hashlib, time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -92,7 +90,7 @@ BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
 CRON_SECRET = os.getenv("CRON_SECRET", "changeme")
 TZ = os.getenv("TZ", "UTC")
 
-# === FLIGHT WATCH – config ===
+# === Flight Watch ===
 AVIATIONSTACK_KEY = os.getenv("AVIATIONSTACK_KEY", "")
 AVIATIONSTACK_URL = "http://api.aviationstack.com/v1/flights"
 NOTIFY_CC_WAIDS = [x.strip() for x in os.getenv("NOTIFY_CC_WAIDS", "").split(",") if x.strip()]
@@ -208,7 +206,7 @@ def init_db():
             waid TEXT,
             created_at TEXT
         );
-        -- === FLIGHT WATCH ===
+        -- Flight Watch
         CREATE TABLE IF NOT EXISTS flight_watch (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             waid TEXT NOT NULL,
@@ -266,7 +264,6 @@ def send_whatsapp(to_waid: str, body: str, media_urls: Optional[List[str]] = Non
     if not twilio_client:
         logger.warning("Twilio client not configured; cannot send outbound.")
         return
-    # normalize outbound
     to_waid = "whatsapp:+" + normalize_waid(to_waid)
     kwargs = dict(to=to_waid, body=body)
     if TWILIO_MESSAGING_SERVICE_SID:
@@ -611,73 +608,14 @@ def store_recommendation_if_relevant(waid: str, text: str, lat: Optional[str], l
     except Exception as e:
         logger.exception("Failed to store recommendation: %s", e)
 
-# ------------------------- Intentים (קיצורי דרך) -------------------------
-FLIGHT_WORDS = ["flight","flights","טיסה","טיסות","כרטיס טיסה","הזמנת טיסה","find flight","book flight"]
-RECO_WORDS = ["המלצות","recommendations","places","מה כדאי","לאן ללכת","מסעדות","ברים","חופים","קפה","אטרקציות"]
-SEND_FILE_WORDS = ["שלח","תשלח","send","הכרטיס","pdf","כרטיס טיסה","ticket","boarding"]
-MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטיסה שלי", "פרטי הטיסה", "flight details", "my flight"]
-
-def detect_intent(text: str) -> str:
-    t = (text or "").lower()
-    if any(w in t for w in MY_FLIGHT_WORDS): return "my_flight"
-    if any(w in t for w in FLIGHT_WORDS): return "flight_search"
-    if "ics" in t and "calendar" in t: return "calendar_link"
-    if any(w in t for w in RECO_WORDS): return "recs_query"
-    if any(w in t for w in SEND_FILE_WORDS): return "recall_file"
-    return "general"
-
-def build_flight_links(origin: Optional[str], dest: Optional[str], depart: Optional[str]) -> List[str]:
-    if origin and dest and depart:
-        g = f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{depart}"
-        k = f"https://www.kayak.com/flights/{origin}-{dest}/{depart}?sort=bestflight_a"
-    elif origin and dest:
-        g = f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}"
-        k = f"https://www.kayak.com/flights/{origin}-{dest}"
-    else:
-        g, k = "https://www.google.com/travel/flights", "https://www.kayak.com/flights"
-    return [g, k]
-
-# ------------------------- === FLIGHT WATCH === core -------------------------
+# ------------------------- Flight Watch helpers -------------------------
 IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
 DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-
-def _fw_parse_track(text: str):
-    t = (text or "").strip().lower()
-    if "עקוב" not in t and "track" not in t: return None, None, False
-    m = IATA_RE.search(text.upper()); 
-    if not m: return None, None, True
-    flight = m.group(1).upper()
-    dm = DATE_RE.search(text); date_str = dm.group(1) if dm else None
-    return flight, date_str, True
-
-def _fw_parse_untrack(text: str):
-    t = (text or "").lower()
-    if not any(k in t for k in ["בטל","unsubscribe","untrack","הסר"]): return None
-    m = IATA_RE.search(text.upper())
-    return m.group(1).upper() if m else "__ALL__"
-
-def _fw_is_list(text: str):
-    return any(k in (text or "").lower() for k in ["רשימה", "list flights", "list"])
 
 def _fw_send_to_all(primary_waid: str, body: str):
     recips = [primary_waid] + [normalize_waid(r) for r in NOTIFY_CC_WAIDS if r]
     for r in recips:
         send_whatsapp(r, body)
-
-def _fw_fmt_time_both(iso_ts: str) -> str:
-    if not iso_ts: return "-"
-    try:
-        t_utc = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-    except Exception:
-        return iso_ts
-    s_utc = t_utc.strftime("%Y-%m-%d %H:%M UTC")
-    if ZoneInfo:
-        try:
-            t_loc = t_utc.astimezone(ZoneInfo(TZ))
-            s_loc = t_loc.strftime(f"%Y-%m-%d %H:%M {TZ}")
-            return f"{s_utc} | {s_loc}"
-        except Exception: pass
-    return s_utc
 
 def _fw_snapshot_from_aviationstack(rec: dict):
     def safe(*keys, default=None):
@@ -702,9 +640,9 @@ def _fw_format_message(snap: dict) -> str:
         f"✈️ עדכון טיסה {f.get('iata') or f.get('number','')}",
         f"סטטוס: {snap.get('status','-')} | חברת תעופה: {snap.get('airline','-')}",
         f"יציאה: {dep.get('airport','-')} טרמ' {dep.get('terminal','-')} שער {dep.get('gate','-')}",
-        f"זמני יציאה: מתוכנן {_fw_fmt_time_both(dep.get('scheduled'))} | משוער {_fw_fmt_time_both(dep.get('estimated'))} | בפועל {_fw_fmt_time_both(dep.get('actual'))}",
+        f"זמני יציאה: מתוכנן {dep.get('scheduled') or '-'} | משוער {dep.get('estimated') or '-'} | בפועל {dep.get('actual') or '-'}",
         f"הגעה: {arr.get('airport','-')} טרמ' {arr.get('terminal','-')} שער {arr.get('gate','-')} (מסוע {arr.get('baggage','-')})",
-        f"זמני הגעה: מתוכנן {_fw_fmt_time_both(arr.get('scheduled'))} | משוער {_fw_fmt_time_both(arr.get('estimated'))} | בפועל {_fw_fmt_time_both(arr.get('actual'))}",
+        f"זמני הגעה: מתוכנן {arr.get('scheduled') or '-'} | משוער {arr.get('estimated') or '-'} | בפועל {arr.get('actual') or '-'}",
     ]; return "\n".join(lines)
 
 def _fw_fetch_aviationstack(flight_iata: str, flight_date: Optional[str]):
@@ -718,7 +656,7 @@ def _fw_fetch_aviationstack(flight_iata: str, flight_date: Optional[str]):
     except Exception as e: return {"error": f"aviationstack JSON parse: {e}", "body": r.text}
     return {"data": data.get("data", [])}
 
-# ------------------------- עזר לטיסות קרובות -------------------------
+# ------------------------- עזר לטיסות קרובות + כינויים -------------------------
 DEFAULT_LOOKAHEAD_DAYS = int(os.getenv("DEFAULT_LOOKAHEAD_DAYS", "90"))
 CONTACT_ALIASES: Dict[str, str] = {}
 for pair in (os.getenv("CONTACT_ALIASES","").split(",") if os.getenv("CONTACT_ALIASES") else []):
@@ -741,25 +679,53 @@ def upcoming_flights_for_waid(waid: str, days_ahead: int = DEFAULT_LOOKAHEAD_DAY
 
 # ------------------------- NL Router (שפה טבעית → פעולה) -------------------------
 def nl_route(user_text: str) -> Optional[dict]:
+    """
+    Returns strict JSON:
+    { "type": one of ["list_user_flights","list_person_flights","subscribe_flight","cancel_flight",
+                      "flight_status","send_last_ticket","list_subscriptions","none"],
+      "params": {...} }
+    """
     if not openai_client or not user_text.strip(): return None
-    sys = ("Turn a WhatsApp travel request into STRICT JSON.\n"
-           "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight','cancel_flight','flight_status','send_last_ticket','none'], params: object}\n"
-           "Return JSON only.")
-    usr = f"Text: {user_text}\nExamples:\n" \
-          "- 'מה הטיסות שלי?' -> {{'type':'list_user_flights','params':{{'range_days':30}}}}\n" \
-          "- 'מה הטיסות של דולב לשבוע הקרוב' -> {{'type':'list_person_flights','params':{{'person':'דולב','range_days':7}}}}\n" \
-          "- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {{'type':'subscribe_flight','params':{{'iata':'LY81','date':'2025-09-08'}}}}\n" \
-          "- 'בטל LY81' -> {{'type':'cancel_flight','params':{{'iata':'LY81'}}}}\n" \
-          "- 'סטטוס LY81' -> {{'type':'flight_status','params':{{'iata':'LY81'}}}}\n" \
-          "- 'שלח לי את הכרטיס' -> {{'type':'send_last_ticket','params':{{}}}}\n"
+    sys = (
+        "You convert a WhatsApp travel request into STRICT JSON for an internal router.\n"
+        "Allowed types: list_user_flights, list_person_flights, subscribe_flight, cancel_flight, "
+        "flight_status, send_last_ticket, list_subscriptions, none.\n"
+        "Rules:\n"
+        "- If the user asks for their upcoming flights, use list_user_flights with {range_days:int?}.\n"
+        "- If the user asks about a named person (e.g., דולב/עודד), use list_person_flights {person, range_days?}.\n"
+        "- To track a flight, use subscribe_flight {iata?:string, date?:YYYY-MM-DD, person?:string, use_next?:boolean}.\n"
+        "  If iata is missing but 'my next flight' is implied, set use_next=true.\n"
+        "- To cancel tracking, use cancel_flight {iata?:string, person?:string}. If no iata, cancel all for that target.\n"
+        "- For flight status, use flight_status {iata:string, date?:YYYY-MM-DD}.\n"
+        "- To send back the last uploaded ticket file, use send_last_ticket {}.\n"
+        "- To show user's subscriptions, use list_subscriptions {}.\n"
+        "- If it's casual chat or unclear, return {type:'none', params:{}}.\n"
+        "Return JSON only. No prose."
+    )
+    ex = (
+        "Examples:\n"
+        "HE: 'מה הטיסות שלי השבוע?' -> {\"type\":\"list_user_flights\",\"params\":{\"range_days\":7}}\n"
+        "HE: 'מה הטיסות של דולב' -> {\"type\":\"list_person_flights\",\"params\":{\"person\":\"דולב\",\"range_days\":90}}\n"
+        "HE: 'שים אותי במעקב על LY81 ב-2025-09-08' -> {\"type\":\"subscribe_flight\",\"params\":{\"iata\":\"LY81\",\"date\":\"2025-09-08\"}}\n"
+        "HE: 'בטל את המעקב על LY81' -> {\"type\":\"cancel_flight\",\"params\":{\"iata\":\"LY81\"}}\n"
+        "HE: 'בטל מעקב על כל הטיסות שלי' -> {\"type\":\"cancel_flight\",\"params\":{}}\n"
+        "HE: 'מה הסטטוס של LY81?' -> {\"type\":\"flight_status\",\"params\":{\"iata\":\"LY81\"}}\n"
+        "HE: 'שלח לי שוב את הכרטיס' -> {\"type\":\"send_last_ticket\",\"params\":{}}\n"
+        "HE: 'מה במעקב אצלי?' -> {\"type\":\"list_subscriptions\",\"params\":{}}\n"
+        "EN: 'track my next flight' -> {\"type\":\"subscribe_flight\",\"params\":{\"use_next\":true}}\n"
+    )
     try:
-        r = openai_client.chat.completions.create(model=OPENAI_MODEL, temperature=0, timeout=12,
-                                                  messages=[{"role":"system","content":sys},{"role":"user","content":usr}])
+        r = openai_client.chat.completions.create(
+            model=OPENAI_MODEL, temperature=0, timeout=12,
+            messages=[{"role":"system","content":sys},{"role":"user","content":ex + "\nText:\n" + user_text}]
+        )
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else s
-        obj = json.loads(s); 
+        obj = json.loads(s)
         if isinstance(obj, dict) and obj.get("type"): return obj
-    except Exception: return None
+    except Exception as e:
+        logger.debug("nl_route parse fail: %s", e)
+        return None
     return None
 
 # ------------------------- Routes בסיס -------------------------
@@ -767,6 +733,20 @@ def nl_route(user_text: str) -> Optional[dict]:
 @app.route("/health", methods=["GET"])
 def health():
     return "Your service is live 🎉", 200
+
+@app.route("/test/openai", methods=["GET"])
+def test_openai():
+    if not openai_client:
+        return "OpenAI client not configured", 200
+    try:
+        r = openai_client.chat.completions.create(
+            model=OPENAI_MODEL, messages=[{"role":"user","content":"ping"}],
+            temperature=0.0, timeout=15,
+        )
+        return f"OK: {(r.choices[0].message.content or '').strip()}", 200
+    except Exception as e:
+        logger.exception("OpenAI test endpoint failed: %s", e)
+        return f"OpenAI error: {e}", 500
 
 @app.route("/status", methods=["GET"])
 def status():
@@ -848,26 +828,16 @@ def google_oauth_callback():
 @app.route("/google/status", methods=["GET"])
 def google_status():
     waid = normalize_waid(request.args.get("waid"))
-    if not waid:
-        return "Missing waid", 400
+    if not waid: return "Missing waid", 400
     ok = load_google_creds(waid) is not None
     return jsonify(ok=ok)
 
-
-# ------------------------- Twilio Webhook -------------------------
-def handle_commands(body: str, waid: str) -> Optional[str]:
+# ------------------------- Twilio Webhook (Free Chat Mode) -------------------------
+def handle_reset_command(body: str, waid: str) -> Optional[str]:
     cmd = (body or "").strip().lower()
     if cmd in ("/reset","reset","/restart"):
-        chat_histories.pop(waid, None); return "✅ השיחה אופסה. תוכל להתחיל נושא חדש."
-    if cmd in ("/help","help"):
-        base = public_base_url()
-        return ("ℹ️ אני יודע:\n"
-                "• 'מה הטיסות שלי' / 'מה הטיסות של דולב/עודד'\n"
-                "• חיפוש טיסות: 'תמצא טיסה TLV→BKK 2025-09-12'\n"
-                f"• גוגל קלנדר: {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
-                "• 'שלח לי את הכרטיס' להחזרת הקובץ האחרון\n"
-                "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'\n"
-                "• /reset לאיפוס שיחה")
+        chat_histories.pop(waid, None)
+        return "✅ השיחה אופסה. אפשר להתחיל מחדש."
     return None
 
 @app.route("/twilio/webhook", methods=["POST"])
@@ -879,9 +849,16 @@ def twilio_webhook():
     num_media = int(request.form.get("NumMedia", "0") or 0)
     latitude = request.form.get("Latitude"); longitude = request.form.get("Longitude")
     address = request.form.get("Address"); label = request.form.get("Label")
+
     resp = MessagingResponse()
 
-    # מדיה נכנסת – שמירה, אינדוקס + סיכום מיידי
+    # 0) Reset command (השארנו רק את זה)
+    cmd_reply = handle_reset_command(body, waid)
+    if cmd_reply:
+        for ch in chunk_text(cmd_reply): resp.message(ch)
+        return str(resp)
+
+    # 1) מדיה נכנסת – שמירה, אינדוקס + סיכום מיידי
     saved_media = []
     if num_media > 0:
         saved_media = handle_incoming_media(waid, num_media, body)
@@ -889,15 +866,15 @@ def twilio_webhook():
             resp.message(f"📎 שמרתי {len(saved_media)} קבצים.")
             try:
                 db = get_db()
-                # הצג עד 2 הטיסות האחרונות שהתווספו (לרוב הלוך/חזור)
                 rows = db.execute("""
                     SELECT origin,dest,depart_date,depart_time,airline,flight_number
                     FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 2
                 """, (waid,)).fetchall()
                 if rows:
-                    lines = ["✈️ מצאתי:"]
-                    for fl in rows[::-1]:
-                        lines.append(f"- {fl['depart_date']} {fl['depart_time'] or ''} {fl['origin'] or ''}→{fl['dest'] or ''} {fl['flight_number'] or ''}{(' | ' + fl['airline']) if fl['airline'] else ''}")
+                    lines = ["✈️ מצאתי:"] + [
+                        f"- {fl['depart_date']} {fl['depart_time'] or ''} {fl['origin'] or ''}→{fl['dest'] or ''} {fl['flight_number'] or ''}{(' | ' + fl['airline']) if fl['airline'] else ''}"
+                        for fl in rows[::-1]
+                    ]
                     for ch in chunk_text("\n".join(lines)): resp.message(ch)
                 else:
                     resp.message("ניסיתי לחלץ פרטים. אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסות שלי'.")
@@ -906,18 +883,14 @@ def twilio_webhook():
                 resp.message("שמרתי את הקובץ. אפשר לכתוב: 'מה הטיסות שלי' או 'שלח לי את הכרטיס'.")
             return str(resp)
 
-    # המלצות/מיקום – נשמור
+    # 2) המלצות/מיקום – לשימור (לא משפיע על זרימה)
     if body or (latitude and longitude): store_recommendation_if_relevant(waid, body, latitude, longitude)
 
-    # פקודות טכניות
-    cmd_reply = handle_commands(body, waid)
-    if cmd_reply:
-        for ch in chunk_text(cmd_reply): resp.message(ch); return str(resp)
-
-    # --- Natural-language router (לפני Intent הישן) ---
+    # 3) NL Router – תרגום לשפה חופשית -> פעולה
     nl = nl_route(body)
-    if nl and nl.get("type") != "none":
+    if nl and nl.get("type"):
         t = nl["type"]; p = nl.get("params") or {}
+
         if t == "list_user_flights":
             rows = upcoming_flights_for_waid(waid, int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
             if not rows: resp.message("לא מצאתי טיסות קרובות."); return str(resp)
@@ -942,29 +915,52 @@ def twilio_webhook():
             return str(resp)
 
         if t == "subscribe_flight":
-            body_override = f"עקוב אחרי טיסה {p.get('iata','').upper()} {p.get('date','')}".strip()
-            track_iata, track_date, is_track_cmd = _fw_parse_track(body_override)
-            if is_track_cmd and track_iata:
-                db = get_db()
-                db.execute("INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
-                           (waid, track_iata, track_date, "aviationstack", None, None)); db.commit()
-                resp.message(f"מעולה! עוקב אחרי {track_iata}" + (f" ({track_date})" if track_date else ""))
-            else: resp.message("לא הצלחתי להבין את הטיסה. נסו למשל: LY81 2025-09-08.")
+            target_person = (p.get("person") or "").strip()
+            target_waid = normalize_waid(CONTACT_ALIASES.get(target_person)) if target_person else waid
+            iata = (p.get("iata") or "").upper().strip()
+            date_str = p.get("date")
+            use_next = bool(p.get("use_next"))
+            if not iata and use_next:
+                # נשתמש בטיסה הקרובה של היעד
+                rows = upcoming_flights_for_waid(target_waid, DEFAULT_LOOKAHEAD_DAYS, limit=1)
+                if rows:
+                    iata = (rows[0]["flight_number"] or "").upper()
+                    date_str = rows[0]["depart_date"]
+            if not iata:
+                resp.message("לא הצלחתי לזהות את מזהה הטיסה. נסה לכתוב למשל: 'עקוב אחרי LY81 בתאריך 2025-09-08' או 'עקוב אחרי הטיסה הקרובה שלי'.")
+                return str(resp)
+            db = get_db()
+            db.execute(
+                "INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
+                (target_waid, iata, date_str, "aviationstack", None, None)
+            ); db.commit()
+            who = "שלי" if target_waid == waid else f"של {target_person}"
+            resp.message(f"מעולה! עוקב אחרי הטיסה {iata}" + (f" ({date_str})" if date_str else "") + f" ({who}).")
             return str(resp)
 
         if t == "cancel_flight":
-            iata = (p.get("iata") or "").upper(); db = get_db()
-            if iata: db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, iata))
-            else: db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
+            target_person = (p.get("person") or "").strip()
+            target_waid = normalize_waid(CONTACT_ALIASES.get(target_person)) if target_person else waid
+            iata = (p.get("iata") or "").upper().strip()
+            db = get_db()
+            if iata:
+                db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (target_waid, iata))
+            else:
+                db.execute("DELETE FROM flight_watch WHERE waid=?", (target_waid,))
             n = db.total_changes; db.commit()
-            resp.message("בוטל מעקב" + (f" אחרי {iata}" if iata else " לכל הטיסות") + f" ({n} רשומות)."); return str(resp)
+            who = "שלי" if target_waid == waid else f"של {target_person}"
+            resp.message("בוטל מעקב" + (f" אחרי {iata}" if iata else " לכל הטיסות") + f" ({who})" + f" — {n} רשומות.")
+            return str(resp)
 
         if t == "flight_status":
-            iata = (p.get("iata") or "").upper()
-            if not iata: resp.message("צריך מזהה טיסה, למשל: סטטוס LY81"); return str(resp)
-            res = _fw_fetch_aviationstack(iata, None)
-            if res.get("error") or not (res.get("data") or []): resp.message("לא מצאתי סטטוס לטיסה הזו כרגע."); return str(resp)
-            snap = _fw_snapshot_from_aviationstack(res["data"][0]); 
+            iata = (p.get("iata") or "").upper().strip()
+            date_str = p.get("date")
+            if not iata: resp.message("צריך מזהה טיסה, למשל: 'LY81'."); return str(resp)
+            res = _fw_fetch_aviationstack(iata, date_str)
+            if res.get("error") or not (res.get("data") or []):
+                resp.message("לא מצאתי סטטוס לטיסה הזו כרגע.")
+                return str(resp)
+            snap = _fw_snapshot_from_aviationstack(res["data"][0])
             for ch in chunk_text(_fw_format_message(snap)): resp.message(ch)
             return str(resp)
 
@@ -972,126 +968,28 @@ def twilio_webhook():
             db = get_db()
             row = db.execute("SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1", (waid,)).fetchone()
             if not row: resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload."); return str(resp)
-            file_url = public_base_url() + f"files/{row['id']}"; m = resp.message(f"📄 {row['filename']}"); m.media(file_url); return str(resp)
+            file_url = public_base_url() + f"files/{row['id']}"; m = resp.message(f"📄 {row['filename']}"); m.media(file_url)
+            return str(resp)
 
-    # === FLIGHT WATCH – פקודות קשיחות (fallback) ===
-    track_iata, track_date, is_track_cmd = _fw_parse_track(body)
-    if is_track_cmd:
-        if not track_iata: resp.message("צריך מזהה טיסה, למשל: 'עקוב אחרי טיסה LY7 2025-09-25'."); return str(resp)
-        db = get_db()
-        db.execute("INSERT INTO flight_watch (waid, flight_iata, flight_date, provider, last_snapshot, last_hash) VALUES (?,?,?,?,?,?)",
-                   (waid, track_iata, track_date, "aviationstack", None, None)); db.commit()
-        resp.message(f"מעולה! עוקב אחרי הטיסה {track_iata}" + (f" לתאריך {track_date}" if track_date else "") + ". אעדכן כשיהיו שינויים.")
-        return str(resp)
+        if t == "list_subscriptions":
+            db = get_db()
+            rows = db.execute("SELECT id, flight_iata, flight_date, created_at FROM flight_watch WHERE waid=? ORDER BY id DESC", (waid,)).fetchall()
+            if not rows: resp.message("אין מנויים פעילים כרגע."); return str(resp)
+            lines = [f"✈️ רשימת מעקבים ({len(rows)}):"] + [
+                f"#{r['id']} {r['flight_iata']}" + (f" {r['flight_date']}" if r['flight_date'] else "") + f" (מ־{r['created_at']})"
+                for r in rows
+            ]
+            for ch in chunk_text("\n".join(lines)): resp.message(ch)
+            return str(resp)
 
-    to_untrack = _fw_parse_untrack(body)
-    if to_untrack:
-        db = get_db()
-        if to_untrack == "__ALL__": db.execute("DELETE FROM flight_watch WHERE waid=?", (waid,))
-        else: db.execute("DELETE FROM flight_watch WHERE waid=? AND flight_iata=?", (waid, to_untrack))
-        n = db.total_changes; db.commit()
-        resp.message("בוטל מעקב" + (f" אחרי {to_untrack}" if to_untrack != "__ALL__" else " לכל הטיסות") + f" ({n} רשומות)."); return str(resp)
+        # type 'none' ייפול לפולבק שיחה חופשית
 
-    if _fw_is_list(body):
-        db = get_db()
-        rows = db.execute("SELECT id, flight_iata, flight_date, created_at FROM flight_watch WHERE waid=? ORDER BY id DESC", (waid,)).fetchall()
-        if not rows: resp.message("אין מנויים פעילים כרגע."); return str(resp)
-        lines = [f"✈️ רשימת מנויים ({len(rows)}):"] + [
-            f"#{r['id']} {r['flight_iata']}" + (f" {r['flight_date']}" if r['flight_date'] else "") + f" (מ־{r['created_at']})"
-            for r in rows
-        ]
-        for ch in chunk_text("\n".join(lines)): resp.message(ch); return str(resp)
-
-    # ---- יתר היכולות (intent ישן + GPT כללי) ----
-    user_text = body.strip()
-    if latitude and longitude:
-        loc = f"[location] lat={latitude}, lon={longitude} | {label or address or ''}"
-        user_text = f"{user_text}\n\n{loc}" if user_text else loc
-
-    if not user_text and saved_media: return str(resp)
+    # 4) פולבק – שיחה כללית (GPT)
+    user_text = (body or "").strip()
     if not user_text:
-        resp.message("👋 כתבו: 'מה הטיסות שלי' / 'מה הטיסות של דולב' / 'סטטוס LY81' / 'שלח לי את הכרטיס' / '/help'.")
+        resp.message("👋 אפשר לשאול: 'מה הטיסות שלי', 'מה הסטטוס של LY81', 'עקוב אחרי הטיסה הקרובה שלי', 'שלח לי את הכרטיס' ועוד—בשפה חופשית.")
         return str(resp)
 
-    intent = detect_intent(user_text)
-
-    # "מה הטיסות שלי" – הקרובות
-    if intent == "my_flight":
-        rows = upcoming_flights_for_waid(waid, days_ahead=DEFAULT_LOOKAHEAD_DAYS)
-        if not rows: resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים."); return str(resp)
-        lines = ["✈️ הטיסות הקרובות שלך:"] + [
-            f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} {r['flight_number'] or ''}{(' | ' + r['airline']) if r['airline'] else ''}"
-            for r in rows
-        ]
-        for ch in chunk_text("\n".join(lines)): resp.message(ch); return str(resp)
-
-    # חיפוש טיסות (קישורים)
-    if intent == "flight_search":
-        airports = detect_airports(user_text); dates = parse_dates(user_text)
-        origin, dest = airports["origin"], airports["dest"];         depart = dates[0] if dates else None
-        if not dest:
-            resp.message("✈️ ציינו יעד (למשל פוקט) ואפשר תאריך YYYY-MM-DD.")
-            return str(resp)
-        links = build_flight_links(origin, dest, depart)
-        msg = (
-            f"✈️ {origin or 'בחר מוצא'} → {dest}\n"
-            f"תאריך יציאה: {depart or 'בחר תאריך'}\n"
-            f"Google Flights: {links[0]}\n"
-            f"Kayak: {links[1]}"
-        )
-        for ch in chunk_text(msg):
-            resp.message(ch)
-        return str(resp)
-
-    # שליחת הקובץ האחרון (כרטיס/טיסה/PDF)
-    if intent == "recall_file":
-        db = get_db()
-        row = db.execute(
-            """
-            SELECT * FROM files
-            WHERE waid=?
-            ORDER BY uploaded_at DESC LIMIT 1
-            """,
-            (waid,)
-        ).fetchone()
-        if not row:
-            resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload.")
-            return str(resp)
-        file_url = public_base_url() + f"files/{row['id']}"
-        m = resp.message(f"📄 {row['filename']}")
-        m.media(file_url)
-        return str(resp)
-
-    # המלצות לפי עיר + קטגוריה
-    if intent == "recs_query":
-        city = extract_city_tag(user_text)
-        cat = infer_category(user_text)
-        db = get_db()
-        q = "SELECT place_name,url,text,category,city_tag FROM recs WHERE waid=?"
-        params: List = [waid]
-        if city:
-            q += " AND LOWER(IFNULL(city_tag,'')) LIKE ?"
-            params.append(f"%{city}%")
-        if cat and cat != "כללי":
-            q += " AND LOWER(IFNULL(category,'')) LIKE ?"
-            params.append(f"%{cat}%")
-        q += " ORDER BY created_at DESC LIMIT 12"
-        rows = db.execute(q, tuple(params)).fetchall()
-        if not rows:
-            resp.message("לא מצאתי המלצות תואמות. שלחו לינקים/מקומות ואשמור לפי עיר/קטגוריה.")
-            return str(resp)
-        lines = [f"⭐ המלצות{(' ל-' + city) if city else ''}{(' – ' + cat) if cat and cat!='כללי' else ''}:"]
-        for r in rows:
-            title = r["place_name"] or (r["text"][:60] if r["text"] else "מקום")
-            if r["url"]:
-                lines.append(f"• {title} — {r['url']}")
-            else:
-                lines.append(f"• {title}")
-        for ch in chunk_text("\n".join(lines)):
-            resp.message(ch)
-        return str(resp)
-
-    # שיחה כללית (GPT) – עם Fallback אם אין מכסה
     history = chat_histories[waid]
     try:
         if not openai_client:
@@ -1105,15 +1003,13 @@ def twilio_webhook():
     except openai.RateLimitError:
         answer = "⚠️ כרגע חרגתי מהמכסה של OpenAI. נסו שוב מעט מאוחר יותר."
     except Exception as e:
-        logger.warning("GPT fallback: %s", e)
+        logger.warning("GPT fallback error: %s", e)
         answer = f"Echo: {user_text[:300]}"
 
     history.append({"role":"user","content":user_text})
     history.append({"role":"assistant","content":answer})
-    if len(history) > 20:
-        del history[:-20]
-    for ch in chunk_text(answer):
-        resp.message(ch)
+    if len(history) > 20: del history[:-20]
+    for ch in chunk_text(answer): resp.message(ch)
     return str(resp)
 
 # ------------------------- Cron helpers -------------------------
@@ -1175,7 +1071,6 @@ def cron_weekly():
 
 # ------------------------- Cron: Flight Watch (בדיקות והתראות) -------------------------
 def _fw_check_and_notify_row(row):
-    """Fetch status, compare hash, notify if changed; update DB."""
     iata = row["flight_iata"]
     fdate = row["flight_date"]
     res = _fw_fetch_aviationstack(iata, fdate)
@@ -1189,13 +1084,11 @@ def _fw_check_and_notify_row(row):
     if h != (row["last_hash"] or ""):
         msg = _fw_format_message(snap)
         _fw_send_to_all(row["waid"], msg)
-        # update
         db = get_db()
         db.execute(
             "UPDATE flight_watch SET last_snapshot=?, last_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (json.dumps(snap, ensure_ascii=False), h, row["id"])
-        )
-        db.commit()
+        ); db.commit()
         return {"ok": True, "notified": True, "id": row["id"]}
     return {"ok": True, "notified": False, "id": row["id"]}
 
@@ -1209,8 +1102,7 @@ def cron_flight_watch():
         out["checked"] += 1
         try:
             res = _fw_check_and_notify_row(r)
-            if res.get("notified"):
-                out["notified"] += 1
+            if res.get("notified"): out["notified"] += 1
         except Exception as e:
             logger.exception("flight_watch cron error: %s", e)
             out["errors"] += 1
@@ -1218,8 +1110,5 @@ def cron_flight_watch():
 
 # ------------------------- Main -------------------------
 if __name__ == "__main__":
-    # הערה: יש טייפו קטן במתודת google_status למעלה – וודא שהשורה היא:
-    # return jsonify(ok=ok)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-
