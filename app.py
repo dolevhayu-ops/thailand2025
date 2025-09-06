@@ -105,9 +105,31 @@ app = Flask(__name__)
 
 # ------------------------- אחסון/DB -------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+
+# נתיב קבוע על דיסק מתמשך (ב-Render הגדֵר Persistent Disk שממופה ל-/data)
+DATA_ROOT = os.getenv("DATA_ROOT") or "/data"
+
+# ודא שהדיסק קיים וכתוב; אם לא — עצור עם שגיאה ברורה
+if not os.path.isdir(DATA_ROOT):
+    raise RuntimeError("Persistent disk is not mounted at /data. In Render, add a Disk and mount it to /data.")
+try:
+    os.makedirs(DATA_ROOT, exist_ok=True)
+    _test_path = os.path.join(DATA_ROOT, ".writetest")
+    with open(_test_path, "w", encoding="utf-8") as _f:
+        _f.write("ok")
+    os.remove(_test_path)
+except Exception as e:
+    raise RuntimeError(f"Cannot write to persistent data root ({DATA_ROOT}). Details: {e}")
+
+# תיקיית קבצים נשמרת בדיסק המתמשך
+STORAGE_DIR = os.path.join(DATA_ROOT, "storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
-DB_PATH = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "data.sqlite3")
+
+# קובץ ה-SQLite יישב בדיסק המתמשך
+DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_ROOT, "data.sqlite3")
+
+
+
 
 def get_db():
     if "db" not in g:
