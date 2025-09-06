@@ -56,13 +56,48 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# --- OpenAI config & helpers ---
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_VERBOSITY = os.getenv("OPENAI_VERBOSITY")  # low|medium|high
-OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT")  # minimal|medium|max
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "You are a concise, helpful WhatsApp assistant. Answer in the user's language."
-)
+OPENAI_VERBOSITY = os.getenv("OPENAI_VERBOSITY")
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT")
+DEBUG_OPENAI_ERRORS = os.getenv("DEBUG_OPENAI_ERRORS", "false").lower() == "true"
+
+def _gpt5_extra():
+    extra = {}
+    if OPENAI_VERBOSITY:
+        extra["verbosity"] = OPENAI_VERBOSITY
+    if OPENAI_REASONING_EFFORT:
+        extra["reasoning_effort"] = OPENAI_REASONING_EFFORT
+    return extra
+
+def gpt_chat(messages, temperature=0.0, timeout=25):
+    """Robust chat call with graceful fallbacks."""
+    if not openai_client:
+        raise RuntimeError("OpenAI client not configured")
+    extra = _gpt5_extra()
+    try:
+        return openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=temperature,
+            timeout=timeout,
+            **({"extra_body": extra} if extra else {}),
+        )
+    except Exception as e1:
+        logger.warning("OpenAI error (with extras): %s", e1)
+        try:
+            return openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        except Exception as e2:
+            logger.exception("OpenAI error (clean retry): %s", e2)
+            if DEBUG_OPENAI_ERRORS:
+                raise
+            raise RuntimeError("openai_failed")
+
 VERIFY_TWILIO_SIGNATURE = os.getenv("VERIFY_TWILIO_SIGNATURE", "false").lower() == "true"
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -450,13 +485,10 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
         "Dates in YYYY-MM-DD, times HH:MM 24h. Only fill known fields."
     )
     try:
-        extra = _gpt5_extra()
-        r = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[...],
-        temperature=0.0, timeout=25,
-        **({"extra_body": extra} if extra else {}),
-    )
+        r = gpt_chat(
+            messages=[{"role":"system","content":prompt},{"role":"user","content":text[:8000]}],
+            temperature=0.0, timeout=25,
+        )
 
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
@@ -488,11 +520,7 @@ def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, l
                 {"type":"image_url","image_url":{"url": image_url}}
             ]}
         ]
-        extra = _gpt5_extra()
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL, messages=messages, temperature=0.0, timeout=30,
-            **({"extra_body": extra} if extra else {}),
-        )
+        r = gpt_chat(messages=messages, temperature=0.0, timeout=30)
 
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
@@ -1024,14 +1052,7 @@ def nl_route(user_text: str) -> Optional[dict]:
     )
 
     try:
-        extra = _gpt5_extra()
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0,
-            timeout=12,
-            messages=[...],
-            **({"extra_body": extra} if extra else {}),
-        )
+        r = gpt_chat(messages=[{"role":"system","content":sys},{"role":"user","content":usr}], temperature=0, timeout=12)
 
 
         s = (r.choices[0].message.content or "").strip()
@@ -1401,23 +1422,12 @@ def twilio_webhook():
 
     # שיחה כללית (GPT) – עם Fallback
     history = chat_histories[waid]
-    try:
-        if not openai_client:
-            raise RuntimeError("OpenAI disabled/not configured")
-            extra = _gpt5_extra()
-            r = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=build_messages(history, user_text),
-                temperature=0.4, timeout=25,
-                **({"extra_body": extra} if extra else {}),
-            )
-
-        answer = (r.choices[0].message.content or "").strip() or "לא הצלחתי לענות כרגע."
-    except openai.RateLimitError:
-        answer = "⚠️ כרגע חרגתי מהמכסה של OpenAI. נסו שוב מעט מאוחר יותר."
-    except Exception as e:
-        logger.warning("GPT fallback: %s", e)
-        answer = f"Echo: {user_text[:300]}"
+try:
+    r = gpt_chat(messages=build_messages(history, user_text), temperature=0.4, timeout=25)
+    answer = (r.choices[0].message.content or "").strip() or "לא הצלחתי לענות כרגע."
+except Exception as e:
+    logger.warning("GPT fallback: %s", e)
+    answer = (f"⚠️ OpenAI error: {e}" if DEBUG_OPENAI_ERRORS else f"Echo: {user_text[:300]}")
 
     history.append({"role":"user","content":user_text})
     history.append({"role":"assistant","content":answer})
