@@ -796,15 +796,6 @@ usr = f"Text: {user_text}\n" + (
     "- 'מה ה-PNR שלי?' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"latest\"}}\n"
 )
 
-
-
-
-
-
-
-Ask ChatGPT
-
-
     try:
         r = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
