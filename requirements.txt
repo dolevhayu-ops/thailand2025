@@ -1,11 +1,26 @@
-flask>=3.0.0
-gunicorn>=21.2.0
-twilio>=9.0.0
-openai>=1.40.0
-requests>=2.31.0
-pypdf==4.2.0
+# Web & runtime
+Flask>=3.0,<4
+gunicorn>=21,<22
+requests>=2.31,<3
 
-# Google Calendar / OAuth
-google-api-python-client>=2.131.0
-google-auth>=2.33.0
-google-auth-oauthlib>=1.2.0
+# Twilio WhatsApp API
+twilio>=9,<10
+
+# OpenAI SDK (v1; מתאים ל-gpt-5/gpt-5-mini)
+openai>=1.40.0
+
+# PDF text extraction
+pypdf>=4.2,<5
+pdfminer.six>=20220524
+
+# Google Calendar OAuth & API
+google-auth>=2.22,<3
+google-auth-oauthlib>=1.2,<2
+google-api-python-client>=2.120,<3
+protobuf>=4.23,<6
+
+# Optional: אזור זמן אחורי לגרסאות פייתון ישנות
+backports.zoneinfo>=0.2.1; python_version < "3.9"
+
+# Optional: טעינת משתני סביבה מקובץ .env (אם תרצה)
+python-dotenv>=1.0,<2
