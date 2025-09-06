@@ -1,4 +1,3 @@
-
 # app.py
 # -*- coding: utf-8 -*-
 """
@@ -13,11 +12,11 @@ WhatsApp Travel Assistant – Flask + Twilio + OpenAI + SQLite + ICS + Cron + Go
 - Flight Watch חינמי (Aviationstack) + התראות לשולח ולנמענים ב־NOTIFY_CC_WAIDS
 """
 
-import os, re, uuid, sqlite3, logging, json, mimetypes, hashlib
+import os, re, uuid, sqlite3, logging, json, mimetypes, hashlib, subprocess
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from collections import defaultdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Tuple
 
 import requests
 from flask import Flask, request, abort, send_file, jsonify, g, Response, redirect
@@ -40,6 +39,17 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
+
+# Optional PDF libs
+try:
+    from pypdf import PdfReader as PyPdfReader
+except Exception:
+    PyPdfReader = None
+
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+except Exception:
+    pdfminer_extract_text = None
 
 # ------------------------- קונפיג ולוגים -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -104,8 +114,6 @@ def normalize_waid(s: Optional[str]) -> Optional[str]:
 app = Flask(__name__)
 
 # ------------------------- אחסון/DB -------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 # נתיב קבוע על דיסק מתמשך (ב-Render הגדֵר Persistent Disk שממופה ל-/data)
 DATA_ROOT = os.getenv("DATA_ROOT") or "/data"
 
@@ -128,9 +136,6 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 # קובץ ה-SQLite יישב בדיסק המתמשך
 DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_ROOT, "data.sqlite3")
 
-
-
-
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
@@ -142,6 +147,15 @@ def close_db(_):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+def _ensure_column(db, table: str, col: str, decl: str):
+    cols = [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        try:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            db.commit()
+        except Exception as e:
+            logger.warning("ALTER TABLE failed (maybe already exists): %s", e)
 
 def init_db():
     db = get_db()
@@ -224,6 +238,9 @@ def init_db():
         """
     )
     db.commit()
+    # מיגרציות: עמודות נוספות בטיסות
+    _ensure_column(db, "flights", "passenger_name", "TEXT")
+    _ensure_column(db, "flights", "eticket", "TEXT")
 
 with app.app_context():
     init_db()
@@ -334,16 +351,101 @@ def detect_airports(text: str) -> Dict[str, Optional[str]]:
         origin = "TLV"
     return {"origin": origin, "dest": dest}
 
+# ------------------------- Regex for structured extraction -------------------------
+RE_PNR = re.compile(r"\b(?:PNR|BOOKING\s*REF(?:ERENCE)?|RES(?:ERVATION)?\s*CODE|RECORD\s*LOCATOR)[:\s\-]*([A-Z0-9]{5,7})\b", re.I)
+RE_ETKT = re.compile(r"\b(?:E-?TICKET|ETKT|TICKET)\s*(?:NO\.?|NUMBER)?[:\s\-]*([0-9]{3}\-?[0-9]{10})\b", re.I)
+RE_FLIGHTNUM = re.compile(r"\b([A-Z]{2}\s?\d{1,4}[A-Z]?)\b")
+RE_IATA_PAIR = re.compile(r"\b([A-Z]{3})\b.{0,8}[→>\-–—]\s*\b([A-Z]{3})\b")
+RE_PASSENGER = re.compile(r"(?:PASSENGER(?:\s*NAME)?|PAX|NAME)[:\s\-]*([A-Z][A-Z' \-]+\/[A-Z][A-Z' \-]+(?:\s+(?:MR|MRS|MS|MISS|MSTR|CHD|INF))?)", re.I)
+
+SUFFIX_RGX = re.compile(r"\b(?:MR|MRS|MS|MISS|MSTR|CHD|INF)\b", re.I)
+
+def _title_from_sabre(name: str) -> str:
+    # "LAST/FIRST MR" -> "First Last"
+    name = name.strip().replace("  ", " ")
+    name = SUFFIX_RGX.sub("", name).strip()
+    if "/" in name:
+        last, first = [x.strip() for x in name.split("/", 1)]
+        return f"{first.title()} {last.title()}".strip()
+    return name.title()
+
+def parse_passenger_names(text: str) -> List[str]:
+    names = set()
+    for m in RE_PASSENGER.finditer(text or ""):
+        nm = _title_from_sabre(m.group(1))
+        if nm:
+            names.add(nm)
+    # עוד ניסיון: לפעמים מצויין "HAYU/DOLEV MR" ללא המילה Passenger
+    for m in re.finditer(r"\b([A-Z][A-Z' \-]+\/[A-Z][A-Z' \-]+(?:\s+(?:MR|MRS|MS|MISS|MSTR|CHD|INF))?)\b", text or ""):
+        nm = _title_from_sabre(m.group(1))
+        if nm:
+            names.add(nm)
+    return list(names)[:6]
+
+def rule_extract_booking(text: str) -> Dict[str, Any]:
+    flights: List[Dict[str, Optional[str]]] = []
+    pnr = None
+    etkt = None
+
+    pnr_m = RE_PNR.search(text or "")
+    if pnr_m:
+        pnr = pnr_m.group(1).upper()
+
+    etkt_m = RE_ETKT.search(text or "")
+    if etkt_m:
+        etkt = etkt_m.group(1).replace("-", "")
+
+    # סריקה לפי שורות: קל לתפוס מקטעים כמו "2025-09-08 22:20 TLV→BKK LY 81 ..."
+    lines = [(l or "").strip() for l in (text or "").splitlines() if (l or "").strip()]
+    for ln in lines:
+        dates = parse_dates(ln)
+        times = parse_times(ln)
+        route = RE_IATA_PAIR.search(ln)
+        flnum = RE_FLIGHTNUM.search(ln)
+        if (dates and route) or (route and flnum):
+            flights.append({
+                "origin": route.group(1) if route else None,
+                "dest": route.group(2) if route else None,
+                "depart_date": dates[0] if dates else None,
+                "depart_time": times[0] if times else None,
+                "arrival_date": None,
+                "arrival_time": None,
+                "airline": None,
+                "flight_number": (flnum.group(1).replace(" ", "") if flnum else None),
+                "pnr": pnr,
+                "eticket": etkt,
+            })
+    # אם לא מצאנו – ניסיון כללי מהטקסט כולו
+    if not flights:
+        airports = detect_airports(text)
+        dates = parse_dates(text)
+        times = parse_times(text)
+        flnum = RE_FLIGHTNUM.search(text)
+        if airports.get("dest") and dates:
+            flights.append({
+                "origin": airports.get("origin"),
+                "dest": airports.get("dest"),
+                "depart_date": dates[0],
+                "depart_time": times[0] if times else None,
+                "arrival_date": None, "arrival_time": None,
+                "airline": None,
+                "flight_number": (flnum.group(1).replace(" ","") if flnum else None),
+                "pnr": pnr, "eticket": etkt
+            })
+
+    return {"flights": flights, "pnr": pnr, "eticket": etkt, "passengers": parse_passenger_names(text)}
+
 # ------------------------- Vision/AI חילוץ נתונים -------------------------
 def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
-    """Return {'flights':[...], 'hotels':[...]} (strict)."""
+    """Return {'flights':[...], 'hotels':[...], 'passengers':[...], 'pnr': str|null, 'eticket': str|null}."""
+    base = {"flights": [], "hotels": [], "passengers": [], "pnr": None, "eticket": None}
     if not openai_client:
-        return {"flights": [], "hotels": []}
+        return base
     prompt = (
-        "Extract flight and hotel details from booking text.\n"
-        "Return STRICT JSON: { flights: [ {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr} ],"
-        "  hotels: [ {hotel_name,city,checkin_date,checkout_date,address} ] }.\n"
-        "Dates in YYYY-MM-DD, times HH:MM 24h. Fill only known fields. If nothing, return empty arrays."
+        "Extract details from booking text.\n"
+        "Return STRICT JSON with keys: flights (array of {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,eticket}), "
+        "hotels (array of {hotel_name,city,checkin_date,checkout_date,address}), passengers (array of names 'First Last'), pnr (string|null), eticket (string|null). "
+        "Dates in YYYY-MM-DD, times HH:MM 24h. Only fill known fields."
     )
     try:
         r = openai_client.chat.completions.create(
@@ -354,25 +456,28 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
         obj = json.loads(s) if s else {}
-        if "flights" not in obj:
-            f = obj.get("flight")
-            obj["flights"] = [f] if isinstance(f, dict) else []
-        if "hotels" not in obj:
-            h = obj.get("hotel")
-            obj["hotels"] = [h] if isinstance(h, dict) else []
-        return {"flights": obj.get("flights") or [], "hotels": obj.get("hotels") or []}
+        out = {**base}
+        out["flights"] = obj.get("flights") or []
+        out["hotels"] = obj.get("hotels") or []
+        out["passengers"] = obj.get("passengers") or []
+        out["pnr"] = obj.get("pnr")
+        out["eticket"] = obj.get("eticket")
+        return out
     except Exception:
-        return {"flights": [], "hotels": []}
+        return base
 
 def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, list]:
+    base = {"flights": [], "hotels": [], "passengers": [], "pnr": None, "eticket": None}
     if not openai_client:
-        return {"flights": [], "hotels": []}
+        return base
     try:
         messages = [
             {"role":"system","content":
-             "You read images of tickets/hotel confirmations and return STRICT JSON as: "
-             "{ flights:[{origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr}],"
-             "  hotels:[{hotel_name,city,checkin_date,checkout_date,address}] } (YYYY-MM-DD, HH:MM)."},
+             "You read images of flight tickets/hotel confirmations and return STRICT JSON: "
+             "{ flights:[{origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,eticket}], "
+             "  hotels:[{hotel_name,city,checkin_date,checkout_date,address}], "
+             "  passengers:[\"First Last\",...], pnr:string|null, eticket:string|null } "
+             "(YYYY-MM-DD, HH:MM)."},
             {"role":"user","content":[
                 {"type":"text","text": (hint or "")},
                 {"type":"image_url","image_url":{"url": image_url}}
@@ -385,11 +490,14 @@ def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, l
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
         obj = json.loads(s) if s else {}
         return {
-            "flights": obj.get("flights") or ([obj.get("flight")] if isinstance(obj.get("flight"), dict) else []) or [],
-            "hotels":  obj.get("hotels")  or ([obj.get("hotel")] if isinstance(obj.get("hotel"), dict)  else []) or [],
+            "flights": obj.get("flights") or [],
+            "hotels":  obj.get("hotels")  or [],
+            "passengers": obj.get("passengers") or [],
+            "pnr": obj.get("pnr"),
+            "eticket": obj.get("eticket"),
         }
     except Exception:
-        return {"flights": [], "hotels": []}
+        return base
 
 # ------------------------- Calendar (Google) -------------------------
 def get_google_flow() -> Optional[Flow]:
@@ -438,52 +546,123 @@ def to_dt_iso(date_str: str, time_str: Optional[str]) -> Optional[str]:
     if time_str and re.match(r"^\d{2}:\d{2}$", time_str): return f"{date_str}T{time_str}:00"
     return f"{date_str}T09:00:00"
 
-# ------------------------- אינדוקס הזמנות (ריבוי טיסות) -------------------------
+# ------------------------- PDF text extraction -------------------------
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
+
+def extract_text_from_pdf(path: str, max_pages: int = MAX_PDF_PAGES) -> str:
+    # 1) pypdf
+    try:
+        if PyPdfReader:
+            rd = PyPdfReader(path)
+            pages = []
+            for i, p in enumerate(rd.pages):
+                if i >= max_pages: break
+                pages.append(p.extract_text() or "")
+            txt = "\n".join(pages).strip()
+            if txt:
+                return txt
+    except Exception as e:
+        logger.debug("pypdf failed: %s", e)
+    # 2) pdfminer.six
+    try:
+        if pdfminer_extract_text:
+            txt = (pdfminer_extract_text(path, maxpages=max_pages) or "").strip()
+            if txt:
+                return txt
+    except Exception as e:
+        logger.debug("pdfminer failed: %s", e)
+    # 3) pdftotext command if available
+    try:
+        cp = subprocess.run(
+            ["pdftotext", "-f", "1", "-l", str(max_pages), "-layout", path, "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
+        txt = cp.stdout.decode("utf-8", errors="ignore").strip()
+        if txt:
+            return txt
+    except Exception as e:
+        logger.debug("pdftotext missing or failed: %s", e)
+    return ""
+
+# ------------------------- אינדוקס הזמנות (מיזוג AI+Rules) -------------------------
+def _merge_flights(primary: List[Dict[str, Any]], fallback: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """ממזג רשומות לפי flight_number+origin+dest+date וממלא שדות חסרים."""
+    def key(f):
+        return (
+            (f.get("flight_number") or "").upper(),
+            (f.get("origin") or "").upper(),
+            (f.get("dest") or "").upper(),
+            (f.get("depart_date") or "")
+        )
+    by = {}
+    for fl in (fallback or []):
+        by[key(fl)] = dict(fl)
+    for fl in (primary or []):
+        k = key(fl)
+        if k in by:
+            base = by[k]
+            for kk, vv in fl.items():
+                if (not base.get(kk)) and vv:
+                    base[kk] = vv
+            by[k] = base
+        else:
+            by[k] = dict(fl)
+    return list(by.values())
+
 def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str], raw_excerpt: str):
     db = get_db()
 
-    # נאיבי (fallback) – טיסה אחת
-    naive_flight = None
-    found_dates = parse_dates(text); found_times = parse_times(text); airports = detect_airports(text)
-    if airports["dest"]:
-        naive_flight = {
-            "origin": airports["origin"], "dest": airports["dest"],
-            "depart_date": (found_dates[0] if found_dates else None),
-            "depart_time": (found_times[0] if found_times else None),
-            "arrival_date": None, "arrival_time": None,
-            "airline": None, "flight_number": None, "pnr": None,
-        }
+    rule = rule_extract_booking(text)
+    ai = ai_extract_booking_from_text(text) if openai_client else {"flights": [], "hotels": [], "passengers": [], "pnr": None, "eticket": None}
 
-    ai = ai_extract_booking_from_text(text) if openai_client else {"flights": [], "hotels": []}
-    flights = ai.get("flights") or []
+    flights = _merge_flights(ai.get("flights") or [], rule.get("flights") or [])
     hotels = ai.get("hotels") or []
+    passengers = list(dict.fromkeys((ai.get("passengers") or []) + (rule.get("passengers") or [])))
+    pnr = ai.get("pnr") or rule.get("pnr")
+    etkt = ai.get("eticket") or rule.get("eticket")
 
-    if not flights and naive_flight and naive_flight.get("dest") and naive_flight.get("depart_date"):
-        flights = [naive_flight]
+    # fallback נאיבי – אם עדיין אין טיסות
+    if not flights:
+        found_dates = parse_dates(text); found_times = parse_times(text); airports = detect_airports(text)
+        if airports["dest"] and found_dates:
+            flights = [{
+                "origin": airports["origin"], "dest": airports["dest"],
+                "depart_date": found_dates[0], "depart_time": (found_times[0] if found_times else None),
+                "arrival_date": None, "arrival_time": None,
+                "airline": None, "flight_number": None, "pnr": pnr, "eticket": etkt,
+            }]
+
+    pax_str = ", ".join(passengers)[:200] if passengers else None
 
     # שמירת כל הטיסות
     for fl in flights:
-        if not fl or not fl.get("dest") or not fl.get("depart_date"): continue
+        if not fl or not fl.get("dest") or not fl.get("depart_date"): 
+            continue
         fid = uuid.uuid4().hex
         db.execute(
             """INSERT INTO flights
-               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,source_file_id,raw_excerpt,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,eticket,source_file_id,raw_excerpt,created_at,passenger_name)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (fid, waid, fl.get("origin"), fl.get("dest"),
              fl.get("depart_date"), fl.get("depart_time"),
              fl.get("arrival_date"), fl.get("arrival_time"),
              fl.get("airline"), fl.get("flight_number"),
-             fl.get("pnr"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
+             (fl.get("pnr") or pnr), (fl.get("eticket") or etkt),
+             source_file_id, raw_excerpt, datetime.utcnow().isoformat(), pax_str)
         )
         start_iso = to_dt_iso(fl.get("depart_date"), fl.get("depart_time"))
         if start_iso:
             summary = f"✈️ {fl.get('origin') or ''}→{fl.get('dest') or ''} {fl.get('flight_number') or ''}".strip()
-            desc = f"Airline: {fl.get('airline') or ''}\nPNR: {fl.get('pnr') or ''}"
-            add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
+            desc = f"Airline: {fl.get('airline') or ''}\\nPNR: {fl.get('pnr') or pnr or ''}\\nPassengers: {pax_str or ''}"
+            try:
+                add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
+            except Exception:
+                pass
 
     # שמירת כל המלונות
     for ho in hotels:
-        if not ho or not ho.get("checkin_date"): continue
+        if not ho or not ho.get("checkin_date"): 
+            continue
         hid = uuid.uuid4().hex
         db.execute(
             """INSERT INTO hotels
@@ -493,13 +672,16 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
              ho.get("checkin_date"), ho.get("checkout_date"),
              ho.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
         )
-        add_calendar_event(
-            waid,
-            f"🏨 Check-in: {ho.get('hotel_name') or ''}",
-            f"City: {ho.get('city') or ''}\nAddress: {ho.get('address') or ''}",
-            ho.get("checkin_date"), ho.get("checkout_date") or ho.get("checkin_date"),
-            all_day=True
-        )
+        try:
+            add_calendar_event(
+                waid,
+                f"🏨 Check-in: {ho.get('hotel_name') or ''}",
+                f"City: {ho.get('city') or ''}\\nAddress: {ho.get('address') or ''}",
+                ho.get("checkin_date"), ho.get("checkout_date") or ho.get("checkin_date"),
+                all_day=True
+            )
+        except Exception:
+            pass
     db.commit()
 
 # ------------------------- אחסון קבצים -------------------------
@@ -531,16 +713,17 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
             excerpt += "\n" + text[:4000]
             index_booking_from_text(waid, text, fid, excerpt[:2000])
         elif (content_type or "").lower() in ("application/pdf",) or name.lower().endswith(".pdf"):
-            from pypdf import PdfReader
-            reader = PdfReader(path)
-            pages = [(p.extract_text() or "") for p in reader.pages[:6]]
-            text = "\n".join(pages)
-            excerpt += "\n" + text[:4000]
-            index_booking_from_text(waid, text, fid, excerpt[:2000])
+            text = extract_text_from_pdf(path)
+            if not text:
+                logger.info("PDF text empty after all strategies.")
+            excerpt += "\n" + (text[:4000] if text else "")
+            index_booking_from_text(waid, text or "", fid, excerpt[:2000])
         elif (content_type or "").lower().startswith("image/"):
             img_url = public_base_url() + f"files/{fid}"
             ai = ai_extract_booking_from_image(img_url, hint=f"File name: {name}")
-            if ai: index_booking_from_text(waid, json.dumps(ai), fid, f"vision:{name}")
+            # נעביר טקסט מלאכותי לאינדוקס (כדי להכנס לפונקציה אחת)
+            synthetic = json.dumps(ai, ensure_ascii=False)
+            index_booking_from_text(waid, synthetic, fid, f"vision:{name}")
     except Exception as e:
         logger.exception("Index from file failed: %s", e)
     return fid
@@ -613,7 +796,7 @@ def store_recommendation_if_relevant(waid: str, text: str, lat: Optional[str], l
 # ------------------------- Intentים (קיצורי דרך – fallback) -------------------------
 FLIGHT_WORDS = ["flight","flights","טיסה","טיסות","כרטיס טיסה","הזמנת טיסה","find flight","book flight"]
 RECO_WORDS = ["המלצות","recommendations","places","מה כדאי","לאן ללכת","מסעדות","ברים","חופים","קפה","אטרקציות"]
-# --- "שלח לי את הכרטיס" intent (רחב ולא פולשני) ---
+
 SEND_FILE_OBJECT_RGX = re.compile(
     r'\b(?:כרטיס(?:\s*טיסה)?|הכרטיס|pdf|קובץ|מסמך|ticket|boarding(?:\s*pass)?|file)\b',
     re.IGNORECASE
@@ -634,25 +817,21 @@ def wants_send_last_ticket(text: str) -> bool:
     if not t:
         return False
     t_norm = re.sub(r'\s+', ' ', t.lower())
-
-    # פקודות קצרות מאוד
     if t_norm in SHORT_SEND_CMDS:
         return True
-
     verb_hit = any(r.search(t_norm) for r in SEND_FILE_VERB_RGXS)
     obj_hit = SEND_FILE_OBJECT_RGX.search(t_norm) is not None
-
-    # ניסוחים בסגנון "אפשר את הכרטיס?" גם בלי פועל מפורש
     polite_short = (re.search(r'\b(?:אפשר|אשמח|בבקשה|תן|תני)\b', t_norm) is not None) and obj_hit
-
     return (verb_hit and obj_hit) or polite_short
 
 MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטיסה שלי", "פרטי הטיסה", "flight details", "my flight"]
 
 def detect_intent(text: str) -> str:
     t = (text or "").lower()
-    if wants_send_last_ticket(text):  # <<< חדש: זיהוי חכם לשליחת קובץ
+    if wants_send_last_ticket(text):
         return "recall_file"
+    if any(w in t for w in ["שמות הנוסעים","שמות הנוסע","על שם מי","שם הכרטיס","מי בכרטיס","שם הנוסע","מי רשום בכרטיס"]):
+        return "ticket_names"
     if any(w in t for w in MY_FLIGHT_WORDS):
         return "my_flight"
     if any(w in t for w in FLIGHT_WORDS):
@@ -661,11 +840,9 @@ def detect_intent(text: str) -> str:
         return "calendar_link"
     if any(w in t for w in RECO_WORDS):
         return "recs_query"
-    # אם יש גם "פרטים" וגם "טיסה" → flight_details
     if "פרטים" in t and "טיסה" in t:
         return "flight_details"
     return "general"
-
 
 # ------------------------- === FLIGHT WATCH === core -------------------------
 IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
@@ -754,7 +931,7 @@ def upcoming_flights_for_waid(waid: str, days_ahead: int = DEFAULT_LOOKAHEAD_DAY
     today = datetime.utcnow().strftime("%Y-%m-%d")
     until = (datetime.utcnow() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     rows = db.execute("""
-        SELECT origin,dest,depart_date,depart_time,airline,flight_number,pnr,arrival_date,arrival_time
+        SELECT origin,dest,depart_date,depart_time,airline,flight_number,pnr,arrival_date,arrival_time,passenger_name
         FROM flights
         WHERE waid=? AND depart_date BETWEEN ? AND ?
         ORDER BY depart_date ASC, IFNULL(depart_time,'23:59') ASC
@@ -766,7 +943,7 @@ def pick_flights_for_details(waid: str, scope: str = "latest"):
     db = get_db()
     today = datetime.utcnow().strftime("%Y-%m-%d")
     rows = db.execute("""
-        SELECT origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr
+        SELECT origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,passenger_name
         FROM flights
         WHERE waid=? AND depart_date >= ?
         ORDER BY depart_date ASC, IFNULL(depart_time,'23:59') ASC
@@ -793,9 +970,24 @@ def format_flight_details(rows):
             f"- חברת תעופה: {r['airline'] or '-'}",
             f"- מספר טיסה: {r['flight_number'] or '-'}",
             f"- PNR: {r['pnr'] or '-'}",
+            f"- נוסעים: {r['passenger_name'] or '-'}",
             ""
         ]
     return "\n".join(lines).strip()
+
+# ------------------------- Flight search links -------------------------
+def build_flight_links(origin: Optional[str], dest: str, depart: Optional[str]) -> Tuple[str, str]:
+    o = (origin or "TLV").upper()
+    d = dest.upper()
+    dt = (depart or "").strip()
+    # Google Flights (approx deep link)
+    g = f"https://www.google.com/travel/flights?hl=en#flt={o}.{d}.{dt}"
+    # Kayak
+    if dt:
+        k = f"https://www.kayak.com/flights/{o}-{d}/{dt}?sort=bestflight_a"
+    else:
+        k = f"https://www.kayak.com/flights/{o}-{d}?sort=bestflight_a"
+    return g, k
 
 # ------------------------- NL Router (שפה טבעית → פעולה) -------------------------
 def nl_route(user_text: str) -> Optional[dict]:
@@ -805,7 +997,7 @@ def nl_route(user_text: str) -> Optional[dict]:
     sys = (
         "Turn a WhatsApp travel request into STRICT JSON.\n"
         "Schema: {type: enum['list_user_flights','list_person_flights','subscribe_flight',"
-        "'cancel_flight','flight_status','send_last_ticket','flight_details','none'], params: object}\n"
+        "'cancel_flight','flight_status','send_last_ticket','flight_details','ticket_names','none'], params: object}\n"
         "Return JSON only."
     )
 
@@ -820,8 +1012,7 @@ def nl_route(user_text: str) -> Optional[dict]:
         "- 'שלח לי את הכרטיס' -> {\"type\":\"send_last_ticket\",\"params\":{}}\n"
         "- 'תן לי פרטים על הטיסה' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"latest\"}}\n"
         "- 'מה הפרטים של הטיסה חזור' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"return\"}}\n"
-        "- 'פרטים על הטיסה חזור' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"return\"}}\n"
-        "- 'מה ה-PNR שלי?' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"latest\"}}\n"
+        "- 'על שם מי הכרטיסים?' -> {\"type\":\"ticket_names\",\"params\":{}}\n"
     )
 
     try:
@@ -847,7 +1038,6 @@ def nl_route(user_text: str) -> Optional[dict]:
         logger.warning("nl_route failed: %s", e)
 
     return None
-
 
 # ------------------------- Routes בסיס -------------------------
 @app.route("/", methods=["GET", "HEAD"])
@@ -898,7 +1088,7 @@ def calendar_ics(waid):
     for fl in flights:
         start = dtstamp(fl["depart_date"], fl["depart_time"] or "09:00")
         summ = f"Flight {fl['origin'] or ''}->{fl['dest'] or ''} {fl['flight_number'] or ''}".strip()
-        desc = f"Airline: {fl['airline'] or ''}\\nPNR: {fl['pnr'] or ''}"
+        desc = f"Airline: {fl['airline'] or ''}\\nPNR: {fl['pnr'] or ''}\\nPassengers: {fl['passenger_name'] or ''}"
         lines += ["BEGIN:VEVENT", f"UID:{fl['id']}@thailandbot", f"DTSTART:{start}", f"SUMMARY:{summ}", f"DESCRIPTION:{desc}", "END:VEVENT"]
     for ho in hotels:
         lines += ["BEGIN:VEVENT", f"UID:{ho['id']}@thailandbot",
@@ -952,6 +1142,7 @@ def handle_commands(body: str, waid: str) -> Optional[str]:
                 "• חיפוש טיסות: 'תמצא טיסה TLV→BKK 2025-09-12'\n"
                 f"• גוגל קלנדר: {base}google/oauth/start?waid=<WaId>  | ICS: {base}calendar/<WaId>.ics\n"
                 "• 'שלח לי את הכרטיס' להחזרת הקובץ האחרון\n"
+                "• 'על שם מי הכרטיסים' להחזרת שמות הנוסעים שנמצאו\n"
                 "• מעקב טיסות: 'עקוב אחרי טיסה LY7 2025-09-25' | 'בטל LY7' | 'רשימה'\n"
                 "• /reset לאיפוס שיחה")
     return None
@@ -972,28 +1163,33 @@ def twilio_webhook():
     if num_media > 0:
         saved_media = handle_incoming_media(waid, num_media, body)
         if saved_media:
-            resp.message(f"📎 שמרתי {len(saved_media)} קבצים.")
+            # סיכום קצר
             try:
                 db = get_db()
                 rows = db.execute("""
-                    SELECT origin,dest,depart_date,depart_time,airline,flight_number,pnr
-                    FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 2
+                    SELECT origin,dest,depart_date,depart_time,airline,flight_number,pnr,passenger_name
+                    FROM flights WHERE waid=? ORDER BY created_at DESC LIMIT 3
                 """, (waid,)).fetchall()
                 if rows:
-                    lines = ["✈️ מצאתי:"]
+                    latest_pax = next((r["passenger_name"] for r in rows if r["passenger_name"]), None)
+                    latest_pnr = next((r["pnr"] for r in rows if r["pnr"]), None)
+                    header = f"📎 שמרתי {len(saved_media)} קבצים."
+                    lines = [header, "✈️ מצאתי:"]
                     for fl in rows[::-1]:
                         lines.append(
                             f"- {fl['depart_date']} {fl['depart_time'] or ''} "
                             f"{fl['origin'] or ''}→{fl['dest'] or ''} "
-                            f"{(fl['flight_number'] or '').strip()} | {fl['airline'] or ''} | PNR: {fl['pnr'] or '-'}"
+                            f"{(fl['flight_number'] or '').strip()} | {fl['airline'] or ''}"
                         )
-                    lines.append("אפשר לכתוב: 'תן לי פרטים על הטיסה' / 'עקוב אחרי טיסה <IATA> <תאריך>'")
+                    if latest_pnr: lines.append(f"• PNR: {latest_pnr}")
+                    if latest_pax: lines.append(f"• נוסעים: {latest_pax}")
+                    lines.append("אפשר לכתוב: 'תן לי פרטים על הטיסה' / 'על שם מי הכרטיסים' / 'עקוב אחרי טיסה <IATA> <תאריך>'")
                     for ch in chunk_text("\n".join(lines)): resp.message(ch)
                 else:
-                    resp.message("ניסיתי לחלץ פרטים. אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסות שלי'.")
+                    resp.message(f"📎 שמרתי {len(saved_media)} קבצים. ניסיתי לחלץ פרטים – אם לא הופיע סיכום, שלחו קובץ אחר או כתבו 'מה הטיסות שלי'.")
             except Exception as e:
                 logger.exception("Post-media summary failed: %s", e)
-                resp.message("שמרתי את הקובץ. אפשר לכתוב: 'מה הטיסות שלי' או 'שלח לי את הכרטיס'.")
+                resp.message(f"📎 שמרתי {len(saved_media)} קבצים. אפשר לכתוב: 'מה הטיסות שלי' או 'שלח לי את הכרטיס'.")
             return str(resp)
 
     # המלצות/מיקום – נשמור
@@ -1017,6 +1213,23 @@ def twilio_webhook():
                 for r in rows
             ]
             for ch in chunk_text("\n".join(lines)): resp.message(ch)
+            return str(resp)
+
+        if t == "ticket_names":
+            db = get_db()
+            rows = db.execute("""
+                SELECT passenger_name, pnr, created_at
+                FROM flights WHERE waid=? AND passenger_name IS NOT NULL
+                ORDER BY created_at DESC LIMIT 5
+            """, (waid,)).fetchall()
+            if not rows:
+                resp.message("לא מצאתי שמות נוסעים. שלחו PDF/תמונה של הכרטיס ואחלץ שוב.")
+                return str(resp)
+            pax = next((r["passenger_name"] for r in rows if r["passenger_name"]), None)
+            pnr = next((r["pnr"] for r in rows if r["pnr"]), None)
+            msg = "👤 שמות הנוסעים שנמצאו: " + pax
+            if pnr: msg += f"\nPNR: {pnr}"
+            for ch in chunk_text(msg): resp.message(ch)
             return str(resp)
 
         if t == "list_person_flights":
@@ -1122,7 +1335,7 @@ def twilio_webhook():
 
     intent = detect_intent(user_text)
 
-    # "מה הטיסות שלי" – הקרובות
+    # "מה הטיסות שלי"
     if intent == "my_flight":
         rows = upcoming_flights_for_waid(waid, days_ahead=DEFAULT_LOOKAHEAD_DAYS)
         if not rows: resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים."); return str(resp)
@@ -1132,7 +1345,7 @@ def twilio_webhook():
         ]
         for ch in chunk_text("\n".join(lines)): resp.message(ch); return str(resp)
 
-    # חיפוש טיסות (קישורים)
+    # חיפוש טיסות
     if intent == "flight_search":
         airports = detect_airports(user_text); dates = parse_dates(user_text)
         origin, dest = airports["origin"], airports["dest"]; depart = dates[0] if dates else None
@@ -1143,7 +1356,7 @@ def twilio_webhook():
         for ch in chunk_text(msg): resp.message(ch)
         return str(resp)
 
-    # שליחת קובץ אחרון (כרטיס/טיסה/PDF)
+    # שליחת קובץ אחרון
     if intent == "recall_file":
         db = get_db()
         row = db.execute("SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1", (waid,)).fetchone()
@@ -1155,7 +1368,7 @@ def twilio_webhook():
         m.media(file_url)
         return str(resp)
 
-    # המלצות לפי עיר + קטגוריה
+    # המלצות
     if intent == "recs_query":
         city = extract_city_tag(user_text); cat = infer_category(user_text)
         db = get_db()
@@ -1170,15 +1383,14 @@ def twilio_webhook():
         if not rows:
             resp.message("לא מצאתי המלצות תואמות. שלחו לינקים/מקומות ואשמור לפי עיר/קטגוריה.")
             return str(resp)
-        lines = [f"⭐ המלצות{(' ל-' + city) if city else ''}{(' – ' + cat) if cat and cat!='כללי' else ''}:"]
-        for r in rows:
-            title = r["place_name"] or (r["text"][:60] if r["text"] else "מקום")
-            if r["url"]: lines.append(f"• {title} — {r['url']}")
-            else: lines.append(f"• {title}")
+        lines = [f"⭐ המלצות{(' ל-' + city) if city else ''}{(' – ' + cat) if cat and cat!='כללי' else ''}:"] + [
+            (f"• {r['place_name'] or (r['text'][:60] if r['text'] else 'מקום')}" + (f" — {r['url']}" if r['url'] else ""))
+            for r in rows
+        ]
         for ch in chunk_text("\n".join(lines)): resp.message(ch)
         return str(resp)
 
-    # שיחה כללית (GPT) – עם Fallback אם אין מכסה
+    # שיחה כללית (GPT) – עם Fallback
     history = chat_histories[waid]
     try:
         if not openai_client:
@@ -1277,7 +1489,6 @@ def cron_flightwatch():
             row2 = db.execute("SELECT last_hash FROM flight_watch WHERE id=?", (r["id"],)).fetchone()
             prev_hash = (row2["last_hash"] if row2 else None)
             if s_hash != prev_hash:
-                # שינוי התגלה → שליחת הודעה ועדכון
                 _fw_send_to_all(r["waid"], _fw_format_message(snap))
                 db.execute("UPDATE flight_watch SET last_snapshot=?, last_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                            (json.dumps(snap, ensure_ascii=False), s_hash, r["id"]))
@@ -1294,4 +1505,3 @@ if __name__ == "__main__":
         init_db()
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
