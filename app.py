@@ -310,12 +310,25 @@ def _validated_twilio_request() -> bool:
     form = request.form.to_dict(flat=True)
     return validator.validate(url, form, signature)
 
+# --- System prompt (global; must be defined before build_messages) ---
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are a concise, helpful WhatsApp assistant. Answer in the user's language."
+)
+
+
 def build_messages(history: List[dict], user_text: str) -> List[dict]:
+    # fallback בטיחותי אם SYSTEM_PROMPT לא מוגדר מסיבה כלשהי
+    sys_prompt = globals().get("SYSTEM_PROMPT") or os.getenv(
+        "SYSTEM_PROMPT",
+        "You are a concise, helpful WhatsApp assistant. Answer in the user's language."
+    )
     trimmed = history[-8:] if len(history) > 8 else history[:]
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs = [{"role": "system", "content": sys_prompt}]
     msgs.extend(trimmed)
     msgs.append({"role": "user", "content": user_text})
     return msgs
+
 
 def send_whatsapp(to_waid: str, body: str, media_urls: Optional[List[str]] = None):
     if not twilio_client:
