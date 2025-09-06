@@ -125,6 +125,36 @@ SYSTEM_PROMPT = os.getenv(
     "You are a concise, helpful WhatsApp assistant. Answer in the user's language."
 )
 
+
+def list_files_for_waid(waid: str, limit: int = 20, offset: int = 0):
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, filename, content_type, uploaded_at "
+        "FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT ? OFFSET ?",
+        (waid, limit, offset)
+    ).fetchall()
+    total = db.execute("SELECT COUNT(*) AS c FROM files WHERE waid=?", (waid,)).fetchone()["c"]
+    return rows, total
+
+def get_file_by_index_or_name(waid: str, index: Optional[int] = None, name: Optional[str] = None):
+    db = get_db()
+    if name:
+        row = db.execute(
+            "SELECT * FROM files WHERE waid=? AND LOWER(filename) LIKE ? "
+            "ORDER BY uploaded_at DESC LIMIT 1",
+            (waid, f"%{name.lower()}%")
+        ).fetchone()
+    else:
+        idx = max(1, int(index or 1))
+        row = db.execute(
+            "SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1 OFFSET ?",
+            (waid, idx - 1)
+        ).fetchone()
+    return row
+
+
+
+
 def build_messages(history: List[dict], user_text: str) -> List[dict]:
     sys_prompt = globals().get("SYSTEM_PROMPT") or os.getenv(
         "SYSTEM_PROMPT",
@@ -825,20 +855,26 @@ def nl_route(user_text: str) -> Optional[dict]:
 - "מה הטיסות שלי לשבוע הקרוב?" ->
   {"type":"list_user_flights","params":{"range_days":7}}
 
+- "תן לי רשימה של כל הקבצים ששמרת לי" ->
+  {"type":"list_files","params":{"limit":20}}
+
+- "שלח את הקובץ האחרון" ->
+  {"type":"send_last_ticket","params":{}}
+
+- "שלח את הקובץ מספר 3" ->
+  {"type":"send_file","params":{"index":3}}
+
+- "שלח את הקובץ עם המילה receipt בשם" ->
+  {"type":"send_file","params":{"name":"receipt"}}
+
 - "מה הסטטוס של LY81?" ->
   {"type":"flight_status","params":{"iata":"LY81"}}
 
 - "עקוב אחרי טיסה LY81 ב-2025-09-08" ->
   {"type":"subscribe_flight","params":{"iata":"LY81","date":"2025-09-08"}}
 
-- "בטל את המעקב על LY81" ->
-  {"type":"cancel_flight","params":{"iata":"LY81"}}
-
 - "בטל את כל המעקבים" ->
   {"type":"cancel_flight","params":{}}
-
-- "שלח לי את הכרטיס שוב" ->
-  {"type":"send_last_ticket","params":{}}
 
 - "תן פרטים על הטיסה חזור" ->
   {"type":"flight_details","params":{"scope":"return"}}
@@ -846,17 +882,11 @@ def nl_route(user_text: str) -> Optional[dict]:
 - "מצא טיסה מתל אביב לפוקט ב-2025-10-01" ->
   {"type":"search_flights","params":{"origin":"TLV","dest":"HKT","depart_date":"2025-10-01"}}
 
-- "על שם מי הכרטיסים?" ->
-  {"type":"ticket_names","params":{}}
-
 - "כמה קבצים שמורים יש לך?" ->
   {"type":"files_count","params":{}}
 
 - "תן קישור ליומן" ->
   {"type":"calendar_link","params":{}}
-
-- "יש המלצות למסעדות בבנגקוק?" ->
-  {"type":"recs_query","params":{"city":"בנגקוק","category":"מסעדה"}}
 
 אם לא ברור:
 - "מה קורה?" -> {"type":"general_chat","params":{"prompt":"מה קורה?"}}
@@ -1022,7 +1052,7 @@ def twilio_webhook():
                         lines.append(f"• PNR: {latest_pnr}")
                     if latest_pax:
                         lines.append(f"• נוסעים: {latest_pax}")
-                    lines.append("אפשר לבקש: 'תן לי פרטים על הטיסה' / 'סטטוס LY81' / 'שלח את הכרטיס' / 'בטל מעקב' וכו׳")
+                    lines.append("אפשר לבקש: 'תן לי פרטים על הטיסה' / 'סטטוס LY81' / 'שלח את הכרטיס' / 'רשימת קבצים' וכו׳")
                     for ch in chunk_text("\n".join(lines)):
                         resp.message(ch)
                 else:
@@ -1041,7 +1071,7 @@ def twilio_webhook():
     t = (nl or {}).get("type") or "general_chat"
     p = (nl or {}).get("params") or {}
 
-    # פעולות
+    # ===== פעולות =====
     if t == "list_user_flights":
         rows = upcoming_flights_for_waid(waid, int(p.get("range_days", DEFAULT_LOOKAHEAD_DAYS)))
         if not rows:
@@ -1196,7 +1226,8 @@ def twilio_webhook():
             return str(resp)
         msg = f"👤 נוסעים: {row['passenger_name']}"
         if row["pnr"]: msg += f"\nPNR: {row['pnr']}"
-        for ch in chunk_text(msg): resp.message(ch)
+        for ch in chunk_text(msg): 
+            resp.message(ch)
         return str(resp)
 
     if t == "calendar_link":
@@ -1204,7 +1235,32 @@ def twilio_webhook():
         resp.message(f"📅 ה-ICS האישי שלך: {ics}")
         return str(resp)
 
-    # ברירת מחדל: שיחה חופשית עם GPT-5
+    # --- יכולות קבצים חדשות ---
+    if t == "list_files":
+        limit = min(int(p.get("limit", 20)), 50)
+        rows, total = list_files_for_waid(waid, limit=limit, offset=int(p.get("offset", 0) or 0))
+        if not rows:
+            resp.message("לא שמרתי עדיין קבצים עבורך.")
+            return str(resp)
+        lines = [f"📁 הקבצים האחרונים ({len(rows)}/{total}):"]
+        for i, r in enumerate(rows, 1):
+            url = public_base_url() + f"files/{r['id']}"
+            lines.append(f"{i}. {r['filename']} — {r['uploaded_at']}\n{url}")
+        for ch in chunk_text("\n".join(lines)):
+            resp.message(ch)
+        return str(resp)
+
+    if t == "send_file":
+        row = get_file_by_index_or_name(waid, index=p.get("index"), name=p.get("name"))
+        if not row:
+            resp.message("לא מצאתי קובץ תואם. נסה לפי מספר ברשימה או חלק מהשם.")
+            return str(resp)
+        file_url = public_base_url() + f"files/{row['id']}"
+        m = resp.message(f"📄 {row['filename']}")
+        m.media(file_url)
+        return str(resp)
+
+    # ===== ברירת מחדל: שיחה חופשית עם GPT-5 =====
     user_text = (p.get("prompt") if isinstance(p.get("prompt"), str) else body) or body
     history = chat_histories[waid]
     try:
