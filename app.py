@@ -70,33 +70,38 @@ def _gpt5_extra():
         extra["reasoning_effort"] = OPENAI_REASONING_EFFORT
     return extra
 
-def gpt_chat(messages, temperature=0.0, timeout=25):
-    """Robust chat call with graceful fallbacks."""
+def gpt_chat(messages, temperature=None, timeout=25):
+    """Robust chat call with graceful fallbacks; omits temperature for GPT-5 models."""
     if not openai_client:
         raise RuntimeError("OpenAI client not configured")
+
     extra = _gpt5_extra()
+    is_gpt5 = str(OPENAI_MODEL or "").lower().startswith("gpt-5")
+
+    base_kwargs = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "timeout": timeout,
+    }
+    # GPT-5 לא תומך ב-temperature → לא שולחים את הפרמטר
+    if (not is_gpt5) and (temperature is not None):
+        base_kwargs["temperature"] = temperature
+
     try:
         return openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=temperature,
-            timeout=timeout,
+            **base_kwargs,
             **({"extra_body": extra} if extra else {}),
         )
     except Exception as e1:
         logger.warning("OpenAI error (with extras): %s", e1)
         try:
-            return openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                temperature=temperature,
-                timeout=timeout,
-            )
+            return openai_client.chat.completions.create(**base_kwargs)
         except Exception as e2:
             logger.exception("OpenAI error (clean retry): %s", e2)
             if DEBUG_OPENAI_ERRORS:
                 raise
             raise RuntimeError("openai_failed")
+
 
 VERIFY_TWILIO_SIGNATURE = os.getenv("VERIFY_TWILIO_SIGNATURE", "false").lower() == "true"
 
