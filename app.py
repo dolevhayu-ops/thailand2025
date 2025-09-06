@@ -782,19 +782,28 @@ def nl_route(user_text: str) -> Optional[dict]:
         "Return JSON only."
     )
 
-    usr = """Text: {}
-Examples:
-- 'מה הטיסות שלי?' -> {"type":"list_user_flights","params":{"range_days":30}}
-- 'מה הטיסות של דולב לשבוע הקרוב' -> {"type":"list_person_flights","params":{"person":"דולב","range_days":7}}
-- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {"type":"subscribe_flight","params":{"iata":"LY81","date":"2025-09-08"}}
-- 'בטל LY81' -> {"type":"cancel_flight","params":{"iata":"LY81"}}
-- 'סטטוס LY81' -> {"type":"flight_status","params":{"iata":"LY81"}}
-- 'שלח לי את הכרטיס' -> {"type":"send_last_ticket","params":{}}
-- 'תן לי פרטים על הטיסה' -> {"type":"flight_details","params":{"scope":"latest"}}
-- 'מה הפרטים של הטיסה חזור' -> {"type":"flight_details","params":{"scope":"return"}}
-- 'פרטים על הטיסה חזור' -> {"type":"flight_details","params":{"scope":"return"}}
-- 'מה ה-PNR שלי?' -> {"type":"flight_details","params":{"scope":"latest"}}
-""".format(user_text)
+usr = f"Text: {user_text}\n" + (
+    "Examples:\n"
+    "- 'מה הטיסות שלי?' -> {\"type\":\"list_user_flights\",\"params\":{\"range_days\":30}}\n"
+    "- 'מה הטיסות של דולב לשבוע הקרוב' -> {\"type\":\"list_person_flights\",\"params\":{\"person\":\"דולב\",\"range_days\":7}}\n"
+    "- 'עקוב אחרי טיסה LY81 ב-2025-09-08' -> {\"type\":\"subscribe_flight\",\"params\":{\"iata\":\"LY81\",\"date\":\"2025-09-08\"}}\n"
+    "- 'בטל LY81' -> {\"type\":\"cancel_flight\",\"params\":{\"iata\":\"LY81\"}}\n"
+    "- 'סטטוס LY81' -> {\"type\":\"flight_status\",\"params\":{\"iata\":\"LY81\"}}\n"
+    "- 'שלח לי את הכרטיס' -> {\"type\":\"send_last_ticket\",\"params\":{}}\n"
+    "- 'תן לי פרטים על הטיסה' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"latest\"}}\n"
+    "- 'מה הפרטים של הטיסה חזור' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"return\"}}\n"
+    "- 'פרטים על הטיסה חזור' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"return\"}}\n"
+    "- 'מה ה-PNR שלי?' -> {\"type\":\"flight_details\",\"params\":{\"scope\":\"latest\"}}\n"
+)
+
+
+
+
+
+
+
+Ask ChatGPT
+
 
     try:
         r = openai_client.chat.completions.create(
