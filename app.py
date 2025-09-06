@@ -1314,25 +1314,6 @@ def twilio_webhook():
                 resp.message(ch)
             return str(resp)
 
-        if t == "ticket_names":
-            db = get_db()
-            rows = db.execute("""
-                SELECT passenger_name, pnr, created_at
-                FROM flights WHERE waid=? AND passenger_name IS NOT NULL
-                ORDER BY created_at DESC LIMIT 5
-            """, (waid,)).fetchall()
-            if not rows:
-                resp.message("לא מצאתי שמות נוסעים. שלחו PDF/תמונה של הכרטיס ואחלץ שוב.")
-                return str(resp)
-            pax = next((r["passenger_name"] for r in rows if r["passenger_name"]), None)
-            pnr = next((r["pnr"] for r in rows if r["pnr"]), None)
-            msg = "👤 שמות הנוסעים שנמצאו: " + pax
-            if pnr:
-                msg += f"\nPNR: {pnr}"
-            for ch in chunk_text(msg):
-                resp.message(ch)
-            return str(resp)
-
         if t == "list_person_flights":
             person = (p.get("person") or "").strip()
             other = CONTACT_ALIASES.get(person)
@@ -1462,139 +1443,138 @@ def twilio_webhook():
             resp.message(ch)
         return str(resp)
 
-  # ----- Default conversational flow -----
-user_text = body.strip()
-if latitude and longitude:
-    loc = f"[location] lat={latitude}, lon={longitude} | {label or address or ''}"
-    user_text = f"{user_text}\n\n{loc}" if user_text else loc
+    # ----- Default conversational flow -----
+    user_text = body.strip()
+    if latitude and longitude:
+        loc = f"[location] lat={latitude}, lon={longitude} | {label or address or ''}"
+        user_text = f"{user_text}\n\n{loc}" if user_text else loc
 
-if not user_text and saved_media:
-    return str(resp)
-if not user_text:
-    resp.message("👋 כתבו: 'מה הטיסות שלי' / 'תן לי פרטים על הטיסה' / 'סטטוס LY81' / 'שלח לי את הכרטיס' / '/help'.")
-    return str(resp)
-
-intent = detect_intent(user_text)
-
-# --- מי רשום בכרטיס / שמות נוסעים ---
-if intent == "ticket_names":
-    db = get_db()
-    row = db.execute(
-        "SELECT passenger_name, pnr FROM flights WHERE waid=? AND passenger_name IS NOT NULL "
-        "ORDER BY created_at DESC LIMIT 1",
-        (waid,)
-    ).fetchone()
-
-    if not row:
-        resp.message("לא מצאתי שמות נוסעים מהכרטיסים האחרונים. שלחו שוב את ה-PDF ואחלץ את השמות.")
+    if not user_text and saved_media:
+        return str(resp)
+    if not user_text:
+        resp.message("👋 כתבו: 'מה הטיסות שלי' / 'תן לי פרטים על הטיסה' / 'סטטוס LY81' / 'שלח לי את הכרטיס' / '/help'.")
         return str(resp)
 
-    msg = f"👤 נוסעים: {row['passenger_name']}"
-    if row["pnr"]:
-        msg += f"\nPNR: {row['pnr']}"
-    for ch in chunk_text(msg):
+    intent = detect_intent(user_text)
+
+    # --- מי רשום בכרטיס / שמות נוסעים ---
+    if intent == "ticket_names":
+        db = get_db()
+        row = db.execute(
+            "SELECT passenger_name, pnr FROM flights WHERE waid=? AND passenger_name IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (waid,)
+        ).fetchone()
+        if not row:
+            resp.message("לא מצאתי שמות נוסעים מהכרטיסים האחרונים. שלחו שוב את ה-PDF ואחלץ את השמות.")
+            return str(resp)
+        msg = f"👤 נוסעים: {row['passenger_name']}"
+        if row["pnr"]:
+            msg += f"\nPNR: {row['pnr']}"
+        for ch in chunk_text(msg):
+            resp.message(ch)
+        return str(resp)
+
+    # --- כמה קבצים שמורים ---
+    if intent == "files_count":
+        c = get_db().execute(
+            "SELECT COUNT(*) AS c FROM files WHERE waid=?",
+            (waid,)
+        ).fetchone()["c"]
+        resp.message(f"יש לך {c} קבצים שמורים.")
+        return str(resp)
+
+    # "מה הטיסות שלי"
+    if intent == "my_flight":
+        rows = upcoming_flights_for_waid(waid, days_ahead=DEFAULT_LOOKAHEAD_DAYS)
+        if not rows:
+            resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים.")
+            return str(resp)
+        lines = ["✈️ הטיסות הקרובות שלך:"] + [
+            f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} "
+            f"{(r['flight_number'] or '').strip()}{(' | ' + r['airline']) if r['airline'] else ''}"
+            for r in rows
+        ]
+        for ch in chunk_text("\n".join(lines)):
+            resp.message(ch)
+        return str(resp)
+
+    # חיפוש טיסות
+    if intent == "flight_search":
+        airports = detect_airports(user_text)
+        dates = parse_dates(user_text)
+        origin, dest = airports["origin"], airports["dest"]
+        depart = dates[0] if dates else None
+        if not dest:
+            resp.message("✈️ ציינו יעד (למשל פוקט) ואפשר תאריך YYYY-MM-DD.")
+            return str(resp)
+        links = build_flight_links(origin, dest, depart)
+        msg = f"✈️ {origin or 'בחר מוצא'} → {dest}\nתאריך יציאה: {depart or 'בחר תאריך'}\nGoogle Flights: {links[0]}\nKayak: {links[1]}"
+        for ch in chunk_text(msg):
+            resp.message(ch)
+        return str(resp)
+
+    # שליחת הקובץ האחרון
+    if intent == "recall_file":
+        db = get_db()
+        row = db.execute(
+            "SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1",
+            (waid,)
+        ).fetchone()
+        if not row:
+            resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload.")
+            return str(resp)
+        file_url = public_base_url() + f"files/{row['id']}"
+        m = resp.message(f"📄 {row['filename']}")
+        m.media(file_url)
+        return str(resp)
+
+    # המלצות
+    if intent == "recs_query":
+        city = extract_city_tag(user_text)
+        cat = infer_category(user_text)
+        db = get_db()
+        q = "SELECT place_name,url,text,category,city_tag FROM recs WHERE waid=?"
+        params: List[str] = [waid]
+        if city:
+            q += " AND LOWER(IFNULL(city_tag,'')) LIKE ?"
+            params.append(f"%{city}%")
+        if cat and cat != "כללי":
+            q += " AND LOWER(IFNULL(category,'')) LIKE ?"
+            params.append(f"%{cat}%")
+        q += " ORDER BY created_at DESC LIMIT 12"
+        rows = db.execute(q, tuple(params)).fetchall()
+        if not rows:
+            resp.message("לא מצאתי המלצות תואמות. שלחו לינקים/מקומות ואשמור לפי עיר/קטגוריה.")
+            return str(resp)
+        lines = [f"⭐ המלצות{(' ל-' + city) if city else ''}{(' – ' + cat) if cat and cat!='כללי' else ''}:"]
+        for r in rows:
+            title = r["place_name"] or (r["text"][:60] if r["text"] else "מקום")
+            lines.append(f"• {title}" + (f" — {r['url']}" if r["url"] else ""))
+        for ch in chunk_text("\n".join(lines)):
+            resp.message(ch)
+        return str(resp)
+
+    # GPT default chat
+    history = chat_histories[waid]
+    try:
+        r = gpt_chat(messages=build_messages(history, user_text), temperature=0.4, timeout=25)
+        answer = (r.choices[0].message.content or "").strip() or "לא הצלחתי לענות כרגע."
+    except openai.RateLimitError:
+        answer = "⚠️ כרגע חרגתי מהמכסה של OpenAI. נסו שוב מעט מאוחר יותר."
+    except Exception as e:
+        logger.warning("GPT fallback: %s", e)
+        answer = (f"⚠️ OpenAI error: {e}" if DEBUG_OPENAI_ERRORS else f"Echo: {user_text[:300]}")
+
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": answer})
+    if len(history) > 20:
+        del history[:-20]
+
+    for ch in chunk_text(answer):
         resp.message(ch)
     return str(resp)
 
-# --- כמה קבצים שמורים ---
-if intent == "files_count":
-    c = get_db().execute(
-        "SELECT COUNT(*) AS c FROM files WHERE waid=?",
-        (waid,)
-    ).fetchone()["c"]
-    resp.message(f"יש לך {c} קבצים שמורים.")
-    return str(resp)
-
-# "מה הטיסות שלי"
-if intent == "my_flight":
-    rows = upcoming_flights_for_waid(waid, days_ahead=DEFAULT_LOOKAHEAD_DAYS)
-    if not rows:
-        resp.message("לא מצאתי טיסות קרובות. שלחו PDF/תמונה של הכרטיס או טקסט עם הפרטים.")
-        return str(resp)
-    lines = ["✈️ הטיסות הקרובות שלך:"] + [
-        f"- {r['depart_date']} {r['depart_time'] or ''} {r['origin'] or ''}→{r['dest'] or ''} "
-        f"{(r['flight_number'] or '').strip()}{(' | ' + r['airline']) if r['airline'] else ''}"
-        for r in rows
-    ]
-    for ch in chunk_text("\n".join(lines)):
-        resp.message(ch)
-    return str(resp)
-
-# חיפוש טיסות
-if intent == "flight_search":
-    airports = detect_airports(user_text)
-    dates = parse_dates(user_text)
-    origin, dest = airports["origin"], airports["dest"]
-    depart = dates[0] if dates else None
-    if not dest:
-        resp.message("✈️ ציינו יעד (למשל פוקט) ואפשר תאריך YYYY-MM-DD.")
-        return str(resp)
-    links = build_flight_links(origin, dest, depart)
-    msg = f"✈️ {origin or 'בחר מוצא'} → {dest}\nתאריך יציאה: {depart or 'בחר תאריך'}\nGoogle Flights: {links[0]}\nKayak: {links[1]}"
-    for ch in chunk_text(msg):
-        resp.message(ch)
-    return str(resp)
-
-# שליחת הקובץ האחרון
-if intent == "recall_file":
-    db = get_db()
-    row = db.execute(
-        "SELECT * FROM files WHERE waid=? ORDER BY uploaded_at DESC LIMIT 1",
-        (waid,)
-    ).fetchone()
-    if not row:
-        resp.message("לא מצאתי קובץ. שלחו PDF/תמונה או העלו דרך /upload.")
-        return str(resp)
-    file_url = public_base_url() + f"files/{row['id']}"
-    m = resp.message(f"📄 {row['filename']}")
-    m.media(file_url)
-    return str(resp)
-
-# המלצות
-if intent == "recs_query":
-    city = extract_city_tag(user_text)
-    cat = infer_category(user_text)
-    db = get_db()
-    q = "SELECT place_name,url,text,category,city_tag FROM recs WHERE waid=?"
-    params: List[str] = [waid]
-    if city:
-        q += " AND LOWER(IFNULL(city_tag,'')) LIKE ?"
-        params.append(f"%{city}%")
-    if cat and cat != "כללי":
-        q += " AND LOWER(IFNULL(category,'')) LIKE ?"
-        params.append(f"%{cat}%")
-    q += " ORDER BY created_at DESC LIMIT 12"
-    rows = db.execute(q, tuple(params)).fetchall()
-    if not rows:
-        resp.message("לא מצאתי המלצות תואמות. שלחו לינקים/מקומות ואשמור לפי עיר/קטגוריה.")
-        return str(resp)
-    lines = [f"⭐ המלצות{(' ל-' + city) if city else ''}{(' – ' + cat) if cat and cat!='כללי' else ''}:"]
-    for r in rows:
-        title = r["place_name"] or (r["text"][:60] if r["text"] else "מקום")
-        lines.append(f"• {title}" + (f" — {r['url']}" if r["url"] else ""))
-    for ch in chunk_text("\n".join(lines)):
-        resp.message(ch)
-    return str(resp)
-
-# GPT default chat
-history = chat_histories[waid]
-try:
-    r = gpt_chat(messages=build_messages(history, user_text), temperature=0.4, timeout=25)
-    answer = (r.choices[0].message.content or "").strip() or "לא הצלחתי לענות כרגע."
-except openai.RateLimitError:
-    answer = "⚠️ כרגע חרגתי מהמכסה של OpenAI. נסו שוב מעט מאוחר יותר."
-except Exception as e:
-    logger.warning("GPT fallback: %s", e)
-    answer = (f"⚠️ OpenAI error: {e}" if DEBUG_OPENAI_ERRORS else f"Echo: {user_text[:300]}")
-
-history.append({"role": "user", "content": user_text})
-history.append({"role": "assistant", "content": answer})
-if len(history) > 20:
-    del history[:-20]
-
-for ch in chunk_text(answer):
-    resp.message(ch)
-return str(resp)
 
 
 
