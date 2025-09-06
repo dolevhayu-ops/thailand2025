@@ -201,9 +201,9 @@ def _ensure_column(db, table: str, col: str, decl: str):
 
 def init_db():
     db = get_db()
-    db.executescript(
-        """
+    db.executescript("""
         PRAGMA journal_mode=WAL;
+
         CREATE TABLE IF NOT EXISTS files (
             id TEXT PRIMARY KEY,
             waid TEXT,
@@ -213,13 +213,8 @@ def init_db():
             title TEXT,
             tags TEXT,
             uploaded_at TEXT
-        )
-        # --- lightweight migration: add passenger_name if missing ---
-try:
-    db.execute("ALTER TABLE flights ADD COLUMN passenger_name TEXT")
-    db.commit()
-except sqlite3.OperationalError:
-    pass  # column already exists;
+        );
+
         CREATE TABLE IF NOT EXISTS flights (
             id TEXT PRIMARY KEY,
             waid TEXT,
@@ -237,6 +232,7 @@ except sqlite3.OperationalError:
             raw_excerpt TEXT,
             created_at TEXT
         );
+
         CREATE TABLE IF NOT EXISTS hotels (
             id TEXT PRIMARY KEY,
             waid TEXT,
@@ -249,6 +245,7 @@ except sqlite3.OperationalError:
             raw_excerpt TEXT,
             created_at TEXT
         );
+
         CREATE TABLE IF NOT EXISTS recs (
             id TEXT PRIMARY KEY,
             waid TEXT,
@@ -261,18 +258,21 @@ except sqlite3.OperationalError:
             url TEXT,
             created_at TEXT
         );
+
         CREATE TABLE IF NOT EXISTS google_tokens (
             waid TEXT PRIMARY KEY,
             token_json TEXT,
             created_at TEXT,
             updated_at TEXT
         );
+
         CREATE TABLE IF NOT EXISTS oauth_states (
             state TEXT PRIMARY KEY,
             waid TEXT,
             created_at TEXT
         );
-        -- === FLIGHT WATCH ===
+
+        -- FLIGHT WATCH
         CREATE TABLE IF NOT EXISTS flight_watch (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             waid TEXT NOT NULL,
@@ -284,9 +284,15 @@ except sqlite3.OperationalError:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
-        """
-    )
+    """)
+
+    # מיגרציה קלה: הוספת passenger_name אם חסר בטבלה קיימת
+    try:
+        db.execute("ALTER TABLE flights ADD COLUMN passenger_name TEXT")
+    except sqlite3.OperationalError:
+        pass  # העמודה כבר קיימת
     db.commit()
+
     # מיגרציות: עמודות נוספות בטיסות
     _ensure_column(db, "flights", "passenger_name", "TEXT")
     _ensure_column(db, "flights", "eticket", "TEXT")
