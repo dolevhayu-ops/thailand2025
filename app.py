@@ -676,84 +676,94 @@ def _merge_flights(primary: List[Dict[str, Any]], fallback: List[Dict[str, Any]]
 def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str], raw_excerpt: str):
     db = get_db()
 
-    rule = rule_extract_booking(text)
-    ai = ai_extract_booking_from_text(text) if openai_client else {"flights": [], "hotels": [], "passengers": [], "pnr": None, "eticket": None}
+    # נאיבי (fallback) – טיסה אחת
+    naive_flight = None
+    found_dates = parse_dates(text)
+    found_times = parse_times(text)
+    airports = detect_airports(text)
+    if airports["dest"]:
+        naive_flight = {
+            "origin": airports["origin"],
+            "dest": airports["dest"],
+            "depart_date": (found_dates[0] if found_dates else None),
+            "depart_time": (found_times[0] if found_times else None),
+            "arrival_date": None,
+            "arrival_time": None,
+            "airline": None,
+            "flight_number": None,
+            "pnr": None,
+        }
 
-    flights = _merge_flights(ai.get("flights") or [], rule.get("flights") or [])
+    ai = ai_extract_booking_from_text(text) if openai_client else {"flights": [], "hotels": []}
+    flights = ai.get("flights") or []
     hotels = ai.get("hotels") or []
-    passengers = list(dict.fromkeys((ai.get("passengers") or []) + (rule.get("passengers") or [])))
-    pnr = ai.get("pnr") or rule.get("pnr")
-    etkt = ai.get("eticket") or rule.get("eticket")
 
-    # fallback נאיבי – אם עדיין אין טיסות
-    if not flights:
-        found_dates = parse_dates(text); found_times = parse_times(text); airports = detect_airports(text)
-        if airports["dest"] and found_dates:
-            flights = [{
-                "origin": airports["origin"], "dest": airports["dest"],
-                "depart_date": found_dates[0], "depart_time": (found_times[0] if found_times else None),
-                "arrival_date": None, "arrival_time": None,
-                "airline": None, "flight_number": None, "pnr": pnr, "eticket": etkt,
-            }]
-
-    pax_str = ", ".join(passengers)[:200] if passengers else None
+    if not flights and naive_flight and naive_flight.get("dest") and naive_flight.get("depart_date"):
+        flights = [naive_flight]
 
     # שמירת כל הטיסות
-for fl in flights:
-    if not fl or not fl.get("dest") or not fl.get("depart_date"):
-        continue
-    pax = fl.get("passengers")
-    if isinstance(pax, list):
-        pax_str = ", ".join([p for p in pax if p])
-    elif isinstance(pax, str):
-        pax_str = pax
-    else:
-        pax_str = None
+    for fl in flights:
+        if not fl or not fl.get("dest") or not fl.get("depart_date"):
+            continue
 
-    fid = uuid.uuid4().hex
-    db.execute(
-        """INSERT INTO flights
-           (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,passenger_name,source_file_id,raw_excerpt,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (fid, waid, fl.get("origin"), fl.get("dest"),
-         fl.get("depart_date"), fl.get("depart_time"),
-         fl.get("arrival_date"), fl.get("arrival_time"),
-         fl.get("airline"), fl.get("flight_number"),
-         fl.get("pnr"), pax_str, source_file_id, raw_excerpt, datetime.utcnow().isoformat())
-    )
+        # נוסעים → מחרוזת יחידה
+        pax = fl.get("passengers")
+        if isinstance(pax, list):
+            pax_str = ", ".join([p for p in pax if p])
+        elif isinstance(pax, str):
+            pax_str = pax
+        else:
+            pax_str = None
+
+        fid = uuid.uuid4().hex
+        db.execute(
+            """INSERT INTO flights
+               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,passenger_name,source_file_id,raw_excerpt,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                fid, waid,
+                fl.get("origin"), fl.get("dest"),
+                fl.get("depart_date"), fl.get("depart_time"),
+                fl.get("arrival_date"), fl.get("arrival_time"),
+                fl.get("airline"), fl.get("flight_number"),
+                fl.get("pnr"), pax_str,
+                source_file_id, raw_excerpt, datetime.utcnow().isoformat()
+            )
+        )
+
         start_iso = to_dt_iso(fl.get("depart_date"), fl.get("depart_time"))
         if start_iso:
             summary = f"✈️ {fl.get('origin') or ''}→{fl.get('dest') or ''} {fl.get('flight_number') or ''}".strip()
-            desc = f"Airline: {fl.get('airline') or ''}\\nPNR: {fl.get('pnr') or pnr or ''}\\nPassengers: {pax_str or ''}"
-            try:
-                add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
-            except Exception:
-                pass
+            desc = f"Airline: {fl.get('airline') or ''}\nPNR: {fl.get('pnr') or ''}"
+            add_calendar_event(waid, summary, desc, start_iso, None, all_day=False)
 
     # שמירת כל המלונות
     for ho in hotels:
-        if not ho or not ho.get("checkin_date"): 
+        if not ho or not ho.get("checkin_date"):
             continue
         hid = uuid.uuid4().hex
         db.execute(
             """INSERT INTO hotels
                (id,waid,hotel_name,city,checkin_date,checkout_date,address,source_file_id,raw_excerpt,created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (hid, waid, ho.get("hotel_name"), ho.get("city"),
-             ho.get("checkin_date"), ho.get("checkout_date"),
-             ho.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat())
-        )
-        try:
-            add_calendar_event(
-                waid,
-                f"🏨 Check-in: {ho.get('hotel_name') or ''}",
-                f"City: {ho.get('city') or ''}\\nAddress: {ho.get('address') or ''}",
-                ho.get("checkin_date"), ho.get("checkout_date") or ho.get("checkin_date"),
-                all_day=True
+            (
+                hid, waid,
+                ho.get("hotel_name"), ho.get("city"),
+                ho.get("checkin_date"), ho.get("checkout_date"),
+                ho.get("address"), source_file_id, raw_excerpt, datetime.utcnow().isoformat()
             )
-        except Exception:
-            pass
+        )
+        add_calendar_event(
+            waid,
+            f"🏨 Check-in: {ho.get('hotel_name') or ''}",
+            f"City: {ho.get('city') or ''}\nAddress: {ho.get('address') or ''}",
+            ho.get("checkin_date"),
+            ho.get("checkout_date") or ho.get("checkin_date"),
+            all_day=True
+        )
+
     db.commit()
+
 
 # ------------------------- אחסון קבצים -------------------------
 def guess_extension(content_type: str, fallback_from_url: str = "") -> str:
