@@ -56,7 +56,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_VERBOSITY = os.getenv("OPENAI_VERBOSITY")  # low|medium|high
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT")  # minimal|medium|max
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a concise, helpful WhatsApp assistant. Answer in the user's language."
@@ -448,11 +450,14 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
         "Dates in YYYY-MM-DD, times HH:MM 24h. Only fill known fields."
     )
     try:
+        extra = _gpt5_extra()
         r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":prompt},{"role":"user","content":text[:8000]}],
-            temperature=0.0, timeout=25,
-        )
+        model=OPENAI_MODEL,
+        messages=[...],
+        temperature=0.0, timeout=25,
+        **({"extra_body": extra} if extra else {}),
+    )
+
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
         obj = json.loads(s) if s else {}
@@ -483,9 +488,12 @@ def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, l
                 {"type":"image_url","image_url":{"url": image_url}}
             ]}
         ]
+        extra = _gpt5_extra()
         r = openai_client.chat.completions.create(
             model=OPENAI_MODEL, messages=messages, temperature=0.0, timeout=30,
+            **({"extra_body": extra} if extra else {}),
         )
+
         s = (r.choices[0].message.content or "").strip()
         s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
         obj = json.loads(s) if s else {}
@@ -1016,15 +1024,16 @@ def nl_route(user_text: str) -> Optional[dict]:
     )
 
     try:
+        extra = _gpt5_extra()
         r = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
             timeout=12,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": usr},
-            ],
+            messages=[...],
+            **({"extra_body": extra} if extra else {}),
         )
+
+
         s = (r.choices[0].message.content or "").strip()
         start = s.find("{")
         end = s.rfind("}")
@@ -1395,11 +1404,14 @@ def twilio_webhook():
     try:
         if not openai_client:
             raise RuntimeError("OpenAI disabled/not configured")
-        r = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=build_messages(history, user_text),
-            temperature=0.4, timeout=25,
-        )
+            extra = _gpt5_extra()
+            r = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=build_messages(history, user_text),
+                temperature=0.4, timeout=25,
+                **({"extra_body": extra} if extra else {}),
+            )
+
         answer = (r.choices[0].message.content or "").strip() or "לא הצלחתי לענות כרגע."
     except openai.RateLimitError:
         answer = "⚠️ כרגע חרגתי מהמכסה של OpenAI. נסו שוב מעט מאוחר יותר."
