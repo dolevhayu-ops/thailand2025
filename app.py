@@ -213,7 +213,13 @@ def init_db():
             title TEXT,
             tags TEXT,
             uploaded_at TEXT
-        );
+        )
+        # --- lightweight migration: add passenger_name if missing ---
+try:
+    db.execute("ALTER TABLE flights ADD COLUMN passenger_name TEXT")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # column already exists;
         CREATE TABLE IF NOT EXISTS flights (
             id TEXT PRIMARY KEY,
             waid TEXT,
@@ -226,6 +232,7 @@ def init_db():
             airline TEXT,
             flight_number TEXT,
             pnr TEXT,
+            passenger_name TEXT,
             source_file_id TEXT,
             raw_excerpt TEXT,
             created_at TEXT
@@ -497,11 +504,14 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
     if not openai_client:
         return base
     prompt = (
-        "Extract details from booking text.\n"
-        "Return STRICT JSON with keys: flights (array of {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,eticket}), "
-        "hotels (array of {hotel_name,city,checkin_date,checkout_date,address}), passengers (array of names 'First Last'), pnr (string|null), eticket (string|null). "
-        "Dates in YYYY-MM-DD, times HH:MM 24h. Only fill known fields."
-    )
+    "Extract flight and hotel details from booking text.\n"
+    "Return STRICT JSON:\n"
+    "{ flights: [ {origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,passengers} ],"
+    "  hotels:  [ {hotel_name,city,checkin_date,checkout_date,address} ] }\n"
+    "Where 'passengers' is an array of full names (['JOHN DOE','JANE DOE']).\n"
+    "Dates in YYYY-MM-DD, times HH:MM 24h. Fill only known fields. If nothing, return empty arrays."
+)
+
     try:
         r = gpt_chat(
             messages=[{"role":"system","content":prompt},{"role":"user","content":text[:8000]}],
@@ -689,21 +699,28 @@ def index_booking_from_text(waid: str, text: str, source_file_id: Optional[str],
     pax_str = ", ".join(passengers)[:200] if passengers else None
 
     # שמירת כל הטיסות
-    for fl in flights:
-        if not fl or not fl.get("dest") or not fl.get("depart_date"): 
-            continue
-        fid = uuid.uuid4().hex
-        db.execute(
-            """INSERT INTO flights
-               (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,eticket,source_file_id,raw_excerpt,created_at,passenger_name)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fid, waid, fl.get("origin"), fl.get("dest"),
-             fl.get("depart_date"), fl.get("depart_time"),
-             fl.get("arrival_date"), fl.get("arrival_time"),
-             fl.get("airline"), fl.get("flight_number"),
-             (fl.get("pnr") or pnr), (fl.get("eticket") or etkt),
-             source_file_id, raw_excerpt, datetime.utcnow().isoformat(), pax_str)
-        )
+for fl in flights:
+    if not fl or not fl.get("dest") or not fl.get("depart_date"):
+        continue
+    pax = fl.get("passengers")
+    if isinstance(pax, list):
+        pax_str = ", ".join([p for p in pax if p])
+    elif isinstance(pax, str):
+        pax_str = pax
+    else:
+        pax_str = None
+
+    fid = uuid.uuid4().hex
+    db.execute(
+        """INSERT INTO flights
+           (id,waid,origin,dest,depart_date,depart_time,arrival_date,arrival_time,airline,flight_number,pnr,passenger_name,source_file_id,raw_excerpt,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (fid, waid, fl.get("origin"), fl.get("dest"),
+         fl.get("depart_date"), fl.get("depart_time"),
+         fl.get("arrival_date"), fl.get("arrival_time"),
+         fl.get("airline"), fl.get("flight_number"),
+         fl.get("pnr"), pax_str, source_file_id, raw_excerpt, datetime.utcnow().isoformat())
+    )
         start_iso = to_dt_iso(fl.get("depart_date"), fl.get("depart_time"))
         if start_iso:
             summary = f"✈️ {fl.get('origin') or ''}→{fl.get('dest') or ''} {fl.get('flight_number') or ''}".strip()
@@ -882,10 +899,17 @@ MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטי
 
 def detect_intent(text: str) -> str:
     t = (text or "").lower()
+
+    # חדש: "על שם מי הכרטיסים?" / "של מי הכרטיס" / "passenger"
+    if re.search(r"(על\s*שם\s*מי|של\s*מי).*(כרטיס|כרטיסים)", t) or ("נוסעים" in t) or ("passenger" in t):
+        return "ticket_names"
+
+    # חדש: "כמה קבצים" / "how many files"
+    if ("כמה" in t) and (("קבצים" in t) or ("files" in t)):
+        return "files_count"
+
     if wants_send_last_ticket(text):
         return "recall_file"
-    if any(w in t for w in ["שמות הנוסעים","שמות הנוסע","על שם מי","שם הכרטיס","מי בכרטיס","שם הנוסע","מי רשום בכרטיס"]):
-        return "ticket_names"
     if any(w in t for w in MY_FLIGHT_WORDS):
         return "my_flight"
     if any(w in t for w in FLIGHT_WORDS):
@@ -897,6 +921,7 @@ def detect_intent(text: str) -> str:
     if "פרטים" in t and "טיסה" in t:
         return "flight_details"
     return "general"
+
 
 # ------------------------- === FLIGHT WATCH === core -------------------------
 IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
@@ -1493,6 +1518,29 @@ def twilio_webhook():
             params.append(f"%{cat}%")
         q += " ORDER BY created_at DESC LIMIT 12"
         rows = db.execute(q, tuple(params)).fetchall()
+    
+    if intent == "ticket_names":
+    row = get_db().execute(
+        "SELECT passenger_name, pnr FROM flights WHERE waid=? AND passenger_name IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+        (waid,)
+    ).fetchone()
+    if not row:
+        resp.message("לא מצאתי שמות נוסעים מהכרטיסים האחרונים. שלחו שוב את ה-PDF ואחלץ את השמות.")
+        return str(resp)
+    msg = f"👤 נוסעים: {row['passenger_name']}"
+    if row["pnr"]:
+        msg += f"\nPNR: {row['pnr']}"
+    for ch in chunk_text(msg):
+        resp.message(ch)
+    return str(resp)
+
+if intent == "files_count":
+    c = get_db().execute("SELECT COUNT(*) AS c FROM files WHERE waid=?", (waid,)).fetchone()["c"]
+    resp.message(f"יש לך {c} קבצים שמורים.")
+    return str(resp)
+
+
+        
         if not rows:
             resp.message("לא מצאתי המלצות תואמות. שלחו לינקים/מקומות ואשמור לפי עיר/קטגוריה.")
             return str(resp)
