@@ -613,32 +613,59 @@ def store_recommendation_if_relevant(waid: str, text: str, lat: Optional[str], l
 # ------------------------- Intentים (קיצורי דרך – fallback) -------------------------
 FLIGHT_WORDS = ["flight","flights","טיסה","טיסות","כרטיס טיסה","הזמנת טיסה","find flight","book flight"]
 RECO_WORDS = ["המלצות","recommendations","places","מה כדאי","לאן ללכת","מסעדות","ברים","חופים","קפה","אטרקציות"]
-SEND_FILE_WORDS = ["שלח","תשלח","send","הכרטיס","pdf","כרטיס טיסה","ticket","boarding"]
+# --- "שלח לי את הכרטיס" intent (רחב ולא פולשני) ---
+SEND_FILE_OBJECT_RGX = re.compile(
+    r'\b(?:כרטיס(?:\s*טיסה)?|הכרטיס|pdf|קובץ|מסמך|ticket|boarding(?:\s*pass)?|file)\b',
+    re.IGNORECASE
+)
+
+SEND_FILE_VERB_RGXS = [
+    re.compile(r'\b(?:שלח(?:י)?|תשלח(?:י)?|שגר|תשגר|העבר|תעביר|שתף|תשתף|forward|share|send(?:\s+me)?|re[-\s]?send|send\s+again)\b', re.IGNORECASE),
+    re.compile(r'(?:(?:אפשר|אשמח|תוכל(?:ה)?|בבקשה)\s+(?:לשלוח|להעביר)(?:\s+לי)?)', re.IGNORECASE),
+]
+
+SHORT_SEND_CMDS = {
+    'שלח', 'שלחי', 'תשלח', 'תשלחי',
+    'send', '/send', 'resend', 'send again', 'forward', 'share'
+}
+
+def wants_send_last_ticket(text: str) -> bool:
+    t = (text or '').strip()
+    if not t:
+        return False
+    t_norm = re.sub(r'\s+', ' ', t.lower())
+
+    # פקודות קצרות מאוד
+    if t_norm in SHORT_SEND_CMDS:
+        return True
+
+    verb_hit = any(r.search(t_norm) for r in SEND_FILE_VERB_RGXS)
+    obj_hit = SEND_FILE_OBJECT_RGX.search(t_norm) is not None
+
+    # ניסוחים בסגנון "אפשר את הכרטיס?" גם בלי פועל מפורש
+    polite_short = (re.search(r'\b(?:אפשר|אשמח|בבקשה|תן|תני)\b', t_norm) is not None) and obj_hit
+
+    return (verb_hit and obj_hit) or polite_short
+
 MY_FLIGHT_WORDS = ["מה הטיסה שלי", "מתי הטיסה שלי", "הטיסה שלי", "פרטי הטיסה", "flight details", "my flight"]
 
 def detect_intent(text: str) -> str:
     t = (text or "").lower()
-    if any(w in t for w in MY_FLIGHT_WORDS): return "my_flight"
-    if any(w in t for w in FLIGHT_WORDS): return "flight_search"
-    if "ics" in t and "calendar" in t: return "calendar_link"
-    if any(w in t for w in RECO_WORDS): return "recs_query"
-    if any(w in t for w in SEND_FILE_WORDS): return "recall_file"
-    # ✨ חדש: אם יש גם "פרטים" וגם "טיסה" → flight_details
+    if wants_send_last_ticket(text):  # <<< חדש: זיהוי חכם לשליחת קובץ
+        return "recall_file"
+    if any(w in t for w in MY_FLIGHT_WORDS):
+        return "my_flight"
+    if any(w in t for w in FLIGHT_WORDS):
+        return "flight_search"
+    if "ics" in t and "calendar" in t:
+        return "calendar_link"
+    if any(w in t for w in RECO_WORDS):
+        return "recs_query"
+    # אם יש גם "פרטים" וגם "טיסה" → flight_details
     if "פרטים" in t and "טיסה" in t:
         return "flight_details"
     return "general"
 
-
-def build_flight_links(origin: Optional[str], dest: Optional[str], depart: Optional[str]) -> List[str]:
-    if origin and dest and depart:
-        g = f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{depart}"
-        k = f"https://www.kayak.com/flights/{origin}-{dest}/{depart}?sort=bestflight_a"
-    elif origin and dest:
-        g = f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}"
-        k = f"https://www.kayak.com/flights/{origin}-{dest}"
-    else:
-        g, k = "https://www.google.com/travel/flights", "https://www.kayak.com/flights"
-    return [g, k]
 
 # ------------------------- === FLIGHT WATCH === core -------------------------
 IATA_RE = re.compile(r"\b([A-Z]{2}\d{1,4})\b", re.IGNORECASE)
