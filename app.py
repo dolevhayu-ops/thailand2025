@@ -1344,6 +1344,26 @@ def cron_flightwatch():
     return jsonify(ok=True, updated=updated, errors=errors, total=len(rows))
 
 # ───────────────────────────── Run ─────────────────────────────
+
+@app.route("/debug/db")
+def debug_db():
+    db = get_db()
+    
+    # Fetch all documents
+    docs = db.execute("SELECT id, filename, doc_type, uploaded_at FROM documents ORDER BY uploaded_at DESC").fetchall()
+    docs_list = [dict(row) for row in docs]
+    
+    # Fetch all passports
+    passports = db.execute("SELECT full_name, passport_number, expiry_date FROM passports").fetchall()
+    passports_list = [dict(row) for row in passports]
+    
+    return jsonify({
+        "documents": docs_list,
+        "passports": passports_list
+    })
+
+
+
 if __name__ == "__main__":
     with app.app_context():
         init_db()
