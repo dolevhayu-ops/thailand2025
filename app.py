@@ -1331,7 +1331,7 @@ def twilio_webhook():
         m = resp.message(f"📄 {row['filename']}"); m.media(file_url)
         return str(resp)
 
-        if t == "send_passport":
+    if t == "send_passport":
         passenger = (p.get("passenger") or "").strip()
         if not passenger:
             resp.message("לא הצלחתי להבין את שם הנוסע בדרכון.")
@@ -1355,7 +1355,6 @@ def twilio_webhook():
         m = resp.message(f"📇 דרכון של {passenger} – {row['filename']}")
         m.media(file_url)
         return str(resp)
-
 
     # ברירת מחדל – שיחה חופשית
     user_text = (p.get("prompt") if isinstance(p.get("prompt"), str) else body) or body
