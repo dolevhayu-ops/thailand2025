@@ -1342,9 +1342,12 @@ def twilio_webhook():
             """SELECT f.*
                FROM files f
                JOIN passports ps ON ps.source_file_id = f.id
-               WHERE f.waid=? AND LOWER(IFNULL(ps.full_name,'')) LIKE ?
+               WHERE f.waid=? AND (
+                    LOWER(IFNULL(ps.full_name,'')) LIKE ?
+                 OR LOWER(f.filename) LIKE ?
+               )
                ORDER BY f.uploaded_at DESC LIMIT 1""",
-            (waid, f"%{passenger.lower()}%")
+            (waid, f"%{passenger.lower()}%", f"%{passenger.lower()}%")
         ).fetchone()
 
         if not row:
