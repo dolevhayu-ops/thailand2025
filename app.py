@@ -930,6 +930,9 @@ def nl_route(user_text: str) -> Optional[dict]:
 - "מה הטיסות שלי לשבוע הקרוב?" ->
   {"type":"list_user_flights","params":{"range_days":7}}
 
+- "שלח את הדרכון של דולב" ->
+  {"type":"send_passport","params":{"passenger":"דולב"}}
+  
 - "מה הסטטוס של LY81?" ->
   {"type":"flight_status","params":{"iata":"LY81"}}
 
@@ -1327,6 +1330,32 @@ def twilio_webhook():
         file_url = public_base_url() + f"files/{row['id']}"
         m = resp.message(f"📄 {row['filename']}"); m.media(file_url)
         return str(resp)
+
+        if t == "send_passport":
+        passenger = (p.get("passenger") or "").strip()
+        if not passenger:
+            resp.message("לא הצלחתי להבין את שם הנוסע בדרכון.")
+            return str(resp)
+
+        db = get_db()
+        row = db.execute(
+            """SELECT f.*
+               FROM files f
+               JOIN passports ps ON ps.source_file_id = f.id
+               WHERE f.waid=? AND LOWER(IFNULL(ps.full_name,'')) LIKE ?
+               ORDER BY f.uploaded_at DESC LIMIT 1""",
+            (waid, f"%{passenger.lower()}%")
+        ).fetchone()
+
+        if not row:
+            resp.message(f"לא מצאתי דרכון עבור {passenger}.")
+            return str(resp)
+
+        file_url = public_base_url() + f"files/{row['id']}"
+        m = resp.message(f"📇 דרכון של {passenger} – {row['filename']}")
+        m.media(file_url)
+        return str(resp)
+
 
     # ברירת מחדל – שיחה חופשית
     user_text = (p.get("prompt") if isinstance(p.get("prompt"), str) else body) or body
