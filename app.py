@@ -263,12 +263,44 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+                CREATE TABLE IF NOT EXISTS passports (
+            id TEXT PRIMARY KEY,
+            waid TEXT,
+            full_name TEXT,
+            passport_number TEXT,
+            nationality TEXT,
+            birth_date TEXT,
+            issue_date TEXT,
+            expiry_date TEXT,
+            mrz TEXT,
+            source_file_id TEXT,
+            created_at TEXT
+        );
+     
     """)
     # מיגרציה מתונה (idempotent)
     try:
         db.execute("ALTER TABLE flights ADD COLUMN passenger_name TEXT")
     except sqlite3.OperationalError:
         pass
+    db.commit()
+def save_passport_record(waid: str, source_file_id: str, p: dict):
+    db = get_db()
+    db.execute(
+        """INSERT INTO passports
+           (id, waid, full_name, passport_number, nationality, birth_date, issue_date, expiry_date, mrz, source_file_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (uuid.uuid4().hex, waid,
+         (p.get("full_name") or None),
+         (p.get("passport_number") or None),
+         (p.get("nationality") or None),
+         (p.get("birth_date") or None),
+         (p.get("issue_date") or None),
+         (p.get("expiry_date") or None),
+         (p.get("mrz") or None),
+         source_file_id,
+         datetime.utcnow().isoformat())
+    )
     db.commit()
 
 with app.app_context():
@@ -402,6 +434,33 @@ def ai_extract_booking_from_text(text: str) -> Dict[str, list]:
     except Exception as e:
         logger.warning("ai_extract_booking_from_text failed: %s", e)
         return {"flights": [], "hotels": []}
+def ai_extract_passport_from_image(image_url: str) -> Optional[dict]:
+    """Use GPT Vision to extract passport fields. Returns dict or None."""
+    if not openai_client:
+        return None
+    try:
+        prompt = (
+            "You are reading a passport photo. Return STRICT JSON with keys: "
+            "{ full_name, passport_number, nationality, birth_date, issue_date, expiry_date, mrz }. "
+            "Dates in YYYY-MM-DD when possible; unknown fields as null. No extra text."
+        )
+        r = gpt_chat(messages=[
+            {"role":"system","content":prompt},
+            {"role":"user","content":[
+                {"type":"text", "text":"Extract the fields from this passport image."},
+                {"type":"image_url","image_url":{"url": image_url}}
+            ]}
+        ], timeout=30)
+        s = (r.choices[0].message.content or "").strip()
+        s = s[s.find("{"):s.rfind("}")+1] if "{" in s and "}" in s else "{}"
+        obj = json.loads(s) if s else {}
+        # sanity: need at least a passport_number or MRZ to consider valid
+        if (obj.get("passport_number") or obj.get("mrz")):
+            return obj
+    except Exception as e:
+        logger.warning("ai_extract_passport_from_image failed: %s", e)
+    return None
+
 
 def ai_extract_booking_from_image(image_url: str, hint: str = "") -> Dict[str, list]:
     if not openai_client:
@@ -562,21 +621,36 @@ def guess_extension(content_type: str, fallback_from_url: str = "") -> str:
 def save_file_record(waid: str, fname: str, content_type: str, data: bytes, title: str = "", tags: str = "") -> str:
     fid = uuid.uuid4().hex
     name = secure_filename(fname) or f"file-{fid}"
-    if "." not in name and content_type: name += guess_extension(content_type)
+    if "." not in name and content_type:
+        name += guess_extension(content_type)
     path = os.path.join(STORAGE_DIR, name)
-    with open(path, "wb") as fp: fp.write(data)
+    with open(path, "wb") as fp:
+        fp.write(data)
+
     db = get_db()
     db.execute(
         "INSERT INTO files (id,waid,filename,content_type,path,title,tags,uploaded_at) VALUES (?,?,?,?,?,?,?,?)",
-        (fid, waid, name, content_type or "application/octet-stream", path, title, tags, datetime.utcnow().isoformat()),
-    ); db.commit()
+        (
+            fid,
+            waid,
+            name,
+            content_type or "application/octet-stream",
+            path,
+            title,
+            tags,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    db.commit()
 
     try:
         excerpt = f"{title or ''}\n{tags or ''}"
+
         if (content_type or "").lower().startswith("text/"):
             text = data.decode("utf-8", errors="ignore")
             excerpt += "\n" + text[:4000]
             index_booking_from_text(waid, text, fid, excerpt[:2000])
+
         elif (content_type or "").lower() in ("application/pdf",) or name.lower().endswith(".pdf"):
             from pypdf import PdfReader
             max_pages = int(os.getenv("MAX_PDF_PAGES", "8"))
@@ -585,14 +659,31 @@ def save_file_record(waid: str, fname: str, content_type: str, data: bytes, titl
             text = "\n".join(pages)
             excerpt += "\n" + text[:4000]
             index_booking_from_text(waid, text, fid, excerpt[:2000])
+
         elif (content_type or "").lower().startswith("image/"):
             img_url = public_base_url() + f"files/{fid}"
+
+            # חילוץ טיסות/מלונות
             ai = ai_extract_booking_from_image(img_url, hint=f"File name: {name}")
             if ai:
                 index_booking_from_text(waid, json.dumps(ai, ensure_ascii=False), fid, f"vision:{name}")
+
+            # חילוץ דרכון
+            p = ai_extract_passport_from_image(img_url)
+            if p and (p.get("passport_number") or p.get("mrz")):
+                save_passport_record(waid, fid, p)
+                summary = "📇 זיהיתי דרכון"
+                if p.get("full_name"):
+                    summary += f" – {p['full_name']}"
+                if p.get("expiry_date"):
+                    summary += f" | תוקף עד {p['expiry_date']}"
+                send_whatsapp(waid, summary + "\nאפשר לבקש: 'שלח לי את צילום הדרכון האחרון'.")
+
     except Exception as e:
         logger.exception("Index from file failed: %s", e)
+
     return fid
+
 
 def handle_incoming_media(waid: str, num_media: int, body_text: str) -> List[str]:
     saved = []
